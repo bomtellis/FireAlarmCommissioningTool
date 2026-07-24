@@ -13,6 +13,8 @@ class DeviceChannel:
     product_code: int
     observed_type: str | None
     output_group: int | None = None
+    output_group_name: str | None = None
+    ringing_style: str | None = None
     record_offset: int = 0
 
 
@@ -28,6 +30,8 @@ class Device:
     product_code: int
     observed_type: str | None
     output_group: int | None = None
+    output_group_name: str | None = None
+    ringing_style: str | None = None
     channels: list[DeviceChannel] = field(default_factory=list)
 
     @property

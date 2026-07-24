@@ -322,6 +322,131 @@ class NodesPage(Page):
             self.refresh()
 
 
+class OutputGroupDevicesDialog(QDialog):
+    def __init__(
+        self,
+        repository: ProjectRepository,
+        node: int,
+        panel: str,
+        output_group: int,
+        group_name: str,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        label = f"Output group {output_group}"
+        if group_name:
+            label += f" — {group_name}"
+        self.setWindowTitle(f"Node {node}: {label}")
+        self.resize(1050, 560)
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"<b>Node {node} — {panel}</b><br>{label}")
+        layout.addWidget(heading)
+        rows = repository.fetch_output_group_devices(node, output_group)
+        table = QTableWidget(0, 9)
+        table.setHorizontalHeaderLabels(
+            [
+                "Loop", "Address", "Sub address", "Zone", "Device text",
+                "Type", "Product", "Ringing style", "Configured group",
+            ]
+        )
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setColumnWidth(4, 280)
+        table.setColumnWidth(5, 190)
+        table.setColumnWidth(7, 220)
+        for row in rows:
+            row_index = table.rowCount()
+            table.insertRow(row_index)
+            values = [
+                row["loop"],
+                row["address"],
+                row["sub_address"],
+                row["zone"],
+                row["text"],
+                catalogue_display_name(row["product_code"], row["observed_type"]),
+                row["product_code"],
+                row["ringing_style"] or "Not specified",
+                row["output_group_name"] or "",
+            ]
+            for column, value in enumerate(values):
+                table.setItem(row_index, column, _item(value))
+        layout.addWidget(table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class OutputGroupsPage(Page):
+    def __init__(self):
+        super().__init__("Output groups")
+        note = QLabel(
+            "Output groups are shown per panel node. Double-click a group to see its "
+            "associated output points and configured ringing styles."
+        )
+        note.setWordWrap(True)
+        self.layout.addWidget(note)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Node", "Panel", "Output group", "Group name", "Devices", "Ringing styles"]
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        self.table.setColumnWidth(1, 260)
+        self.table.setColumnWidth(3, 280)
+        self.table.setColumnWidth(5, 300)
+        self.table.doubleClicked.connect(self.open_group)
+        self.layout.addWidget(self.table, 1)
+
+    def refresh(self) -> None:
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        if not self.repository:
+            return
+        for row in self.repository.fetch_output_groups():
+            row_index = self.table.rowCount()
+            self.table.insertRow(row_index)
+            values = [
+                row["node"],
+                row["panel"],
+                row["output_group"],
+                row["group_name"],
+                row["device_count"],
+                row["ringing_styles"] or "Not specified",
+            ]
+            for column, value in enumerate(values):
+                item = _item(value)
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    (
+                        int(row["node"]),
+                        str(row["panel"]),
+                        int(row["output_group"]),
+                        str(row["group_name"] or ""),
+                    ),
+                )
+                self.table.setItem(row_index, column, item)
+        self.table.setSortingEnabled(True)
+
+    def open_group(self, index) -> None:
+        if not self.repository:
+            return
+        item = self.table.item(index.row(), 0)
+        if item is None:
+            return
+        node, panel, output_group, group_name = item.data(Qt.ItemDataRole.UserRole)
+        OutputGroupDevicesDialog(
+            self.repository,
+            node,
+            panel,
+            output_group,
+            group_name,
+            self,
+        ).exec()
+
+
 class ZonesMapPage(Page):
     geometry_changed = Signal()
 
@@ -1130,12 +1255,16 @@ class MainWindow(QMainWindow):
         self.navigation.setObjectName("navigation")
         self.navigation.setFixedWidth(225)
         self.navigation.addItems(
-            ["Overview", "Devices", "Nodes", "Zones & drawings", "Cause & effect", "Test mode", "Tracked changes"]
+            [
+                "Overview", "Devices", "Nodes", "Output groups", "Zones & drawings",
+                "Cause & effect", "Test mode", "Tracked changes",
+            ]
         )
         self.pages = [
             DashboardPage(),
             DevicesPage(),
             NodesPage(),
+            OutputGroupsPage(),
             ZonesMapPage(),
             MatrixPage(),
             TestPage(),
@@ -1170,7 +1299,7 @@ class MainWindow(QMainWindow):
         project_layout.addSpacing(18)
         for text, icon, callback in (
             ("Update NCF", "fa5s.arrows-rotate", self.update_ncf),
-            ("Import DXF", "fa5s.map", lambda: self._navigate(3)),
+            ("Import DXF", "fa5s.map", lambda: self._navigate(4)),
             ("Export Excel", "fa5s.file-excel", self.export_excel),
             ("Changes PDF", "fa5s.file-pdf", self.export_pdf),
         ):
@@ -1181,10 +1310,11 @@ class MainWindow(QMainWindow):
         for text, icon, index in (
             ("Devices", "fa5s.microchip", 1),
             ("Nodes", "fa5s.network-wired", 2),
-            ("Map zones", "fa5s.draw-polygon", 3),
-            ("Matrix", "fa5s.table-cells", 4),
-            ("Test mode", "fa5s.fire", 5),
-            ("Changes", "fa5s.code-compare", 6),
+            ("Output groups", "fa5s.volume-high", 3),
+            ("Map zones", "fa5s.draw-polygon", 4),
+            ("Matrix", "fa5s.table-cells", 5),
+            ("Test mode", "fa5s.fire", 6),
+            ("Changes", "fa5s.code-compare", 7),
         ):
             commission_layout.addWidget(self._ribbon_button(text, icon, lambda checked=False, i=index: self._navigate(i)))
         commission_layout.addStretch()
@@ -1296,7 +1426,7 @@ class MainWindow(QMainWindow):
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             _, changes = self.repository.import_ncf(path)
             self._set_repository(self.repository)
-            self._navigate(6)
+            self._navigate(7)
             QMessageBox.information(self, "NCF update complete", f"Recorded {len(changes)} changes.")
         except Exception as error:
             QMessageBox.critical(self, "NCF update failed", str(error))

@@ -23,6 +23,81 @@ def _i32(data: bytes, offset: int) -> int:
     return struct.unpack_from("<i", data, offset)[0]
 
 
+def _u16(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def _ascii_slot(data: bytes, length_offset: int, maximum: int) -> str:
+    if length_offset < 0 or length_offset >= len(data):
+        return ""
+    length = data[length_offset]
+    if length > maximum or length_offset + 1 + length > len(data):
+        return ""
+    value = data[length_offset + 1 : length_offset + 1 + length]
+    if not all(32 <= byte <= 126 for byte in value):
+        return ""
+    return value.decode("ascii", errors="replace").strip()
+
+
+def _parse_output_groups(data: bytes) -> tuple[dict[int, str], dict[int, str]]:
+    """Decode ConfigTool ringing styles and output-rule group references."""
+    style_names: dict[int, str] = {}
+    style_signature = struct.pack("<i", 33)
+    cursor = 0
+    while True:
+        marker = data.find(style_signature, cursor)
+        if marker < 0:
+            break
+        cursor = marker + 1
+        start = marker - 8
+        if start < 26 or start + 16 > len(data):
+            continue
+        # Ringing-style records are 224 bytes apart. The style label occupies
+        # the final 26-byte string slot immediately before its record header.
+        neighbouring_record = (
+            (start >= 224 and _i32(data, start - 224 + 8) == 33)
+            or (start + 224 + 12 <= len(data) and _i32(data, start + 224 + 8) == 33)
+        )
+        style_number = _i32(data, start + 12)
+        name = _ascii_slot(data, start - 26, 24)
+        if neighbouring_record and 0 <= style_number <= 255 and name:
+            style_names[style_number] = name
+
+    group_names: dict[int, str] = {}
+    group_style_numbers: dict[int, set[int]] = {}
+    rule_signature = struct.pack("<i", 9)
+    cursor = 0
+    while True:
+        marker = data.find(rule_signature, cursor)
+        if marker < 0:
+            break
+        cursor = marker + 1
+        start = marker - 8
+        if start < 0 or start + 112 > len(data):
+            continue
+        neighbouring_record = (
+            (start >= 112 and _i32(data, start - 112 + 8) == 9)
+            or (start + 112 + 12 <= len(data) and _i32(data, start + 112 + 8) == 9)
+        )
+        if not neighbouring_record:
+            continue
+        group = _i32(data, start + 12)
+        style_number = _i32(data, start + 24)
+        name = _ascii_slot(data, start + 71, 39)
+        if not (0 < group <= 65535):
+            continue
+        if name and group not in group_names:
+            group_names[group] = name
+        if style_number in style_names:
+            group_style_numbers.setdefault(group, set()).add(style_number)
+
+    group_styles = {
+        group: ", ".join(style_names[number] for number in sorted(numbers))
+        for group, numbers in group_style_numbers.items()
+    }
+    return group_names, group_styles
+
+
 def _is_point_record(data: bytes, offset: int) -> bool:
     if offset < 0 or offset + POINT_RECORD_SIZE > len(data):
         return False
@@ -112,6 +187,7 @@ def _parse_site(data: bytes) -> tuple[list[tuple[int, str]], dict[int, str]]:
 
 def _parse_panel(node: int, name: str, data: bytes) -> Panel:
     table_offset, record_count = _find_point_table(data)
+    group_names, group_styles = _parse_output_groups(data)
     device_map: OrderedDict[tuple[int, int], Device] = OrderedDict()
 
     if table_offset is not None:
@@ -125,12 +201,16 @@ def _parse_panel(node: int, name: str, data: bytes) -> Panel:
             zone = _i32(data, offset + 48)
             product_code = _i32(data, offset + 12)
             observed_type = CONFIRMED_GENERIC_TYPES.get(product_code)
+            output_group = _u16(data, offset + 60) or None
             channel = DeviceChannel(
                 sub_address=sub_address,
                 text=text,
                 zone=zone,
                 product_code=product_code,
                 observed_type=observed_type,
+                output_group=output_group,
+                output_group_name=group_names.get(output_group),
+                ringing_style=group_styles.get(output_group),
                 record_offset=offset,
             )
 
@@ -146,6 +226,9 @@ def _parse_panel(node: int, name: str, data: bytes) -> Panel:
                     zone=zone,
                     product_code=product_code,
                     observed_type=observed_type,
+                    output_group=output_group,
+                    output_group_name=group_names.get(output_group),
+                    ringing_style=group_styles.get(output_group),
                 )
             device_map[key].channels.append(channel)
 
@@ -234,8 +317,8 @@ def parse_ncf(path: str | Path) -> ParsedNcf:
             + ", ".join(str(value) for value in unknown_codes)
         )
     warnings.append(
-        "Output-group and proprietary cause/effect fields are not yet decoded; "
-        "they remain editable project data rather than inferred NCF values."
+        "Native point output groups and configured ringing styles were decoded. "
+        "Cause/effect logic remains editable project data pending full rule decoding."
     )
     return ParsedNcf(
         source=source,

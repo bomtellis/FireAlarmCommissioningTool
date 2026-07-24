@@ -19,6 +19,18 @@ def test_project_import_and_duplicate_detection(tmp_path: Path) -> None:
     assert len(repository.fetch_zones()) > 0
     zone_179 = next(row for row in repository.fetch_zones() if row["number"] == 179)
     assert zone_179["description"] == "PATH LAB FIRST FLOOR"
+    node_52_groups = [
+        row for row in repository.fetch_output_groups() if row["node"] == 52
+    ]
+    group_50 = next(row for row in node_52_groups if row["output_group"] == 50)
+    assert group_50["group_name"] == "PATHOLOGY ACCESS DOORS"
+    assert group_50["device_count"] == 2
+    assert group_50["ringing_styles"] == "Evacuate"
+    group_devices = repository.fetch_output_group_devices(52, 50)
+    assert [(row["loop"], row["address"], row["sub_address"]) for row in group_devices] == [
+        (1, 41, 3),
+        (1, 42, 3),
+    ]
 
     snapshot_id, changes = repository.import_ncf(ROOT / "Leighton-Site.NCF")
     assert snapshot_id == 1

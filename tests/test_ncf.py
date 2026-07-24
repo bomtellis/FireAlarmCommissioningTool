@@ -35,6 +35,10 @@ def test_multi_channel_module_is_one_physical_device() -> None:
     module = next(device for device in node_52.devices if device.loop == 1 and device.address == 41)
     assert len(module.channels) == 3
     assert [channel.sub_address for channel in module.channels] == [1, 2, 3]
+    output = module.channels[2]
+    assert output.output_group == 50
+    assert output.output_group_name == "PATHOLOGY ACCESS DOORS"
+    assert output.ringing_style == "Evacuate"
 
 
 def test_supplied_protocol_catalogue_code_inventory() -> None:

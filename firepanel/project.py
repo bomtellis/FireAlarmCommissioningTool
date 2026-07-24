@@ -13,7 +13,7 @@ from .models import Change, ParsedNcf
 from .ncf import parse_ncf
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 SCHEMA = """
@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS devices (
     product_code INTEGER NOT NULL,
     observed_type TEXT,
     output_group INTEGER,
+    output_group_name TEXT,
+    ringing_style TEXT,
     record_offset INTEGER NOT NULL,
     PRIMARY KEY (snapshot_id, stable_key)
 );
@@ -188,11 +190,19 @@ class ProjectRepository:
     def _initialise(self) -> None:
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+            device_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(devices)")
+            }
+            if "output_group_name" not in device_columns:
+                connection.execute("ALTER TABLE devices ADD COLUMN output_group_name TEXT")
+            if "ringing_style" not in device_columns:
+                connection.execute("ALTER TABLE devices ADD COLUMN ringing_style TEXT")
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
         self._backfill_zone_descriptions()
+        self._backfill_output_groups()
 
     def _backfill_zone_descriptions(self) -> None:
         """Populate projects created before SITE zone names were decoded."""
@@ -221,6 +231,48 @@ class ProjectRepository:
             return
         with self.connection() as connection:
             self._upsert_zones(connection, parsed)
+
+    def _backfill_output_groups(self) -> None:
+        """Populate native group data in projects imported by older parsers."""
+        with self.connection() as connection:
+            snapshot = connection.execute(
+                "SELECT id, source_path FROM snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            populated = connection.execute(
+                "SELECT 1 FROM devices WHERE output_group IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if (
+            populated
+            or not snapshot
+            or not Path(snapshot["source_path"]).exists()
+        ):
+            return
+        try:
+            parsed = parse_ncf(snapshot["source_path"])
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return
+        rows = []
+        for panel in parsed.panels:
+            for device in panel.devices:
+                for channel in device.channels:
+                    rows.append(
+                        (
+                            channel.output_group,
+                            channel.output_group_name,
+                            channel.ringing_style,
+                            snapshot["id"],
+                            f"{device.node}/{device.loop}/{device.address}/{channel.sub_address}",
+                        )
+                    )
+        with self.connection() as connection:
+            connection.executemany(
+                """
+                UPDATE devices
+                SET output_group = ?, output_group_name = ?, ringing_style = ?
+                WHERE snapshot_id = ? AND stable_key = ?
+                """,
+                rows,
+            )
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -360,6 +412,8 @@ class ProjectRepository:
                             channel.product_code,
                             channel.observed_type,
                             channel.output_group,
+                            channel.output_group_name,
+                            channel.ringing_style,
                             channel.record_offset,
                         )
                     )
@@ -367,8 +421,9 @@ class ProjectRepository:
             """
             INSERT INTO devices(
                 snapshot_id, stable_key, node, panel, loop, address, sub_address,
-                zone, text, product_code, observed_type, output_group, record_offset
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                zone, text, product_code, observed_type, output_group,
+                output_group_name, ringing_style, record_offset
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             device_rows,
         )
@@ -478,6 +533,47 @@ class ProjectRepository:
                     ORDER BY p.node
                     """,
                     (snapshot_id,),
+                )
+            )
+
+    def fetch_output_groups(self, snapshot_id: int | None = None) -> list[sqlite3.Row]:
+        snapshot_id = snapshot_id or self.latest_snapshot_id()
+        if snapshot_id is None:
+            return []
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT node, panel, output_group,
+                           MAX(COALESCE(output_group_name, '')) AS group_name,
+                           COUNT(DISTINCT loop || '/' || address) AS device_count,
+                           GROUP_CONCAT(DISTINCT ringing_style) AS ringing_styles
+                    FROM devices
+                    WHERE snapshot_id = ?
+                      AND output_group IS NOT NULL
+                      AND output_group > 0
+                    GROUP BY node, panel, output_group
+                    ORDER BY node, output_group
+                    """,
+                    (snapshot_id,),
+                )
+            )
+
+    def fetch_output_group_devices(
+        self, node: int, output_group: int, snapshot_id: int | None = None
+    ) -> list[sqlite3.Row]:
+        snapshot_id = snapshot_id or self.latest_snapshot_id()
+        if snapshot_id is None:
+            return []
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT * FROM devices
+                    WHERE snapshot_id = ? AND node = ? AND output_group = ?
+                    ORDER BY loop, address, sub_address
+                    """,
+                    (snapshot_id, node, output_group),
                 )
             )
 
