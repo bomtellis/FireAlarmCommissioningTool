@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# FirePanel project databases and generated reports
+*.fcp
+*.fcp-shm
+*.fcp-wal
+*.xlsx
+*.pdf
+ncf-points.json
+
+# Site source files may contain sensitive configuration and access settings
+*.ncf
+*.NCF
+*.pcf
+*.PCF
+/zones.csv
+*.dxf
+*.DXF
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
