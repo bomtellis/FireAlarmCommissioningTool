@@ -525,24 +525,38 @@ class TestPage(Page):
         controls = QHBoxLayout()
         self.zone_combo = QComboBox()
         self.scope_combo = QComboBox()
+        self.engineer = QLineEdit()
+        self.engineer.setPlaceholderText("Engineer")
+        self.engineer.setMaximumWidth(180)
         run = QPushButton("Simulate fire trigger")
         run.clicked.connect(self.simulate)
+        save = QPushButton("Record test")
+        save.setProperty("secondary", True)
+        save.clicked.connect(self.record_test)
         controls.addWidget(QLabel("Fire in zone"))
         controls.addWidget(self.zone_combo)
         controls.addWidget(QLabel("Scope"))
         controls.addWidget(self.scope_combo)
+        controls.addWidget(self.engineer)
         controls.addWidget(run)
+        controls.addWidget(save)
         controls.addStretch()
         self.layout.addLayout(controls)
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.scene = QGraphicsScene()
         self.map = QGraphicsView(self.scene)
         self.map.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.results = QTableWidget(0, 7)
+        self.results = QTableWidget(0, 9)
         self.results.setHorizontalHeaderLabels(
-            ["State", "Zone", "Node", "Loop", "Address", "Sub", "Device / effect"]
+            [
+                "Expected", "Zone", "Node", "Loop", "Address", "Sub",
+                "Device / effect", "Observed / result", "Comments",
+            ]
         )
         self.results.setAlternatingRowColors(True)
+        self.results.setColumnWidth(6, 280)
+        self.results.setColumnWidth(7, 150)
+        self.results.setColumnWidth(8, 320)
         splitter.addWidget(self.map)
         splitter.addWidget(self.results)
         self.layout.addWidget(splitter, 1)
@@ -570,7 +584,7 @@ class TestPage(Page):
         self._draw_map(effect_map)
         self.results.setRowCount(0)
         for effect in effects:
-            self._append_result([effect.state, effect.zone, "", "", "", "", effect.reason])
+            self._append_result([effect.state, effect.zone, "", "", "", "", effect.reason], None)
         for device in self.repository.fetch_devices():
             if device["zone"] not in effect_map:
                 continue
@@ -585,20 +599,48 @@ class TestPage(Page):
                     device["address"],
                     device["sub_address"],
                     device["text"] or device["observed_type"],
-                ]
+                ],
+                device["stable_key"],
             )
 
-    def _append_result(self, values: list[object]) -> None:
+    def _append_result(self, values: list[object], stable_key: str | None) -> None:
         row = self.results.rowCount()
         self.results.insertRow(row)
-        for column, value in enumerate(values):
+        for column, value in enumerate(values + ["", ""]):
             item = _item(value)
             if column == 0:
+                item.setData(Qt.ItemDataRole.UserRole, stable_key)
                 if str(value) == "EVACUATE":
                     item.setBackground(QColor("#f8d7da"))
                 elif str(value) == "ALERT":
                     item.setBackground(QColor("#fff3cd"))
             self.results.setItem(row, column, item)
+
+    def record_test(self) -> None:
+        if not self.repository or self.zone_combo.currentData() is None or self.results.rowCount() == 0:
+            QMessageBox.information(self, "Nothing to record", "Run a fire trigger simulation first.")
+            return
+        results: list[tuple[str | None, str, str, str]] = []
+        for row in range(self.results.rowCount()):
+            expected_item = self.results.item(row, 0)
+            stable_key = expected_item.data(Qt.ItemDataRole.UserRole)
+            # Summary effect rows have no stable device key and are retained as zone observations.
+            if stable_key is None:
+                stable_key = f"zone/{self.results.item(row, 1).text()}"
+            result = self.results.item(row, 7).text()
+            comments = self.results.item(row, 8).text()
+            results.append((stable_key, expected_item.text(), result, comments))
+        session_id = self.repository.create_test_session(
+            self.engineer.text().strip(),
+            self.scope_combo.currentData(),
+            int(self.zone_combo.currentData()),
+            results,
+        )
+        QMessageBox.information(
+            self,
+            "Test recorded",
+            f"Commissioning test session {session_id} was saved with {len(results)} results/comments.",
+        )
 
     def _draw_map(self, effect_map: dict[int, str]) -> None:
         self.scene.clear()

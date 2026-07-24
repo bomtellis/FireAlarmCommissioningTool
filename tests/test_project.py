@@ -22,3 +22,13 @@ def test_project_import_and_duplicate_detection(tmp_path: Path) -> None:
     assert snapshot_id == 1
     assert changes == []
     assert len(repository.fetch_snapshots()) == 1
+
+    session_id = repository.create_test_session(
+        engineer="Commissioning Engineer",
+        scope_node=52,
+        trigger_zone=179,
+        results=[("52/1/1/1", "EVACUATE", "Pass", "Detector and outputs witnessed")],
+    )
+    assert session_id == 1
+    sessions = repository.fetch_test_sessions()
+    assert sessions[0]["result_count"] == 1

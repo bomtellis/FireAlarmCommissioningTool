@@ -584,6 +584,61 @@ class ProjectRepository:
                 for row in connection.execute("SELECT * FROM node_power")
             }
 
+    def create_test_session(
+        self,
+        engineer: str,
+        scope_node: int | None,
+        trigger_zone: int,
+        results: Iterable[tuple[str | None, str, str, str]],
+        notes: str = "",
+    ) -> int:
+        """Persist the current simulation/check as a commissioning test session."""
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO test_sessions(started_at, completed_at, engineer, scope_node, notes)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (_now(), _now(), engineer, scope_node, notes),
+            )
+            session_id = int(cursor.lastrowid)
+            connection.executemany(
+                """
+                INSERT INTO test_results(
+                    session_id, trigger_zone, stable_key, expected_state,
+                    actual_state, result, comments, tested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        session_id,
+                        trigger_zone,
+                        stable_key,
+                        expected_state,
+                        result,
+                        _normalise_test_result(result),
+                        comments,
+                        _now(),
+                    )
+                    for stable_key, expected_state, result, comments in results
+                ],
+            )
+            return session_id
+
+    def fetch_test_sessions(self) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT s.*, COUNT(r.id) AS result_count
+                    FROM test_sessions s
+                    LEFT JOIN test_results r ON r.session_id = s.id
+                    GROUP BY s.id
+                    ORDER BY s.id DESC
+                    """
+                )
+            )
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -591,3 +646,12 @@ def _now() -> str:
 
 def _stringify(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _normalise_test_result(value: str) -> str:
+    normalised = value.strip().casefold()
+    if normalised in {"pass", "passed", "ok", "correct"}:
+        return "pass"
+    if normalised in {"fail", "failed", "incorrect"}:
+        return "fail"
+    return "not-tested" if not normalised else "observation"
