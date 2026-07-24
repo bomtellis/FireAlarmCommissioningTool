@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -191,6 +192,35 @@ class ProjectRepository:
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+        self._backfill_zone_descriptions()
+
+    def _backfill_zone_descriptions(self) -> None:
+        """Populate projects created before SITE zone names were decoded."""
+        with self.connection() as connection:
+            counts = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN TRIM(description) <> '' THEN 1 ELSE 0 END) AS named
+                FROM zones
+                """
+            ).fetchone()
+            snapshot = connection.execute(
+                "SELECT source_path FROM snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if (
+            not counts
+            or not counts["total"]
+            or counts["named"]
+            or not snapshot
+            or not Path(snapshot["source_path"]).exists()
+        ):
+            return
+        try:
+            parsed = parse_ncf(snapshot["source_path"])
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return
+        with self.connection() as connection:
+            self._upsert_zones(connection, parsed)
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -243,6 +273,7 @@ class ProjectRepository:
                 "SELECT id FROM snapshots WHERE sha256 = ?", (parsed.sha256,)
             ).fetchone()
             if existing:
+                self._upsert_zones(connection, parsed)
                 return int(existing["id"]), []
 
             previous_snapshot = connection.execute("SELECT MAX(id) AS id FROM snapshots").fetchone()["id"]
@@ -341,9 +372,22 @@ class ProjectRepository:
             """,
             device_rows,
         )
+        ProjectRepository._upsert_zones(connection, parsed)
+
+    @staticmethod
+    def _upsert_zones(
+        connection: sqlite3.Connection, parsed: ParsedNcf
+    ) -> None:
         connection.executemany(
-            "INSERT OR IGNORE INTO zones(number) VALUES (?)",
-            [(zone.number,) for zone in parsed.zones],
+            """
+            INSERT INTO zones(number, description) VALUES (?, ?)
+            ON CONFLICT(number) DO UPDATE SET
+                description = CASE
+                    WHEN TRIM(zones.description) = '' THEN excluded.description
+                    ELSE zones.description
+                END
+            """,
+            [(zone.number, zone.description) for zone in parsed.zones],
         )
 
     @staticmethod

@@ -17,6 +17,8 @@ def test_project_import_and_duplicate_detection(tmp_path: Path) -> None:
     assert len(repository.fetch_panels()) == 61
     assert len(repository.fetch_devices()) == 9965
     assert len(repository.fetch_zones()) > 0
+    zone_179 = next(row for row in repository.fetch_zones() if row["number"] == 179)
+    assert zone_179["description"] == "PATH LAB FIRST FLOOR"
 
     snapshot_id, changes = repository.import_ncf(ROOT / "Leighton-Site.NCF")
     assert snapshot_id == 1

@@ -72,7 +72,7 @@ def _find_point_table(data: bytes) -> tuple[int | None, int]:
     return best_offset, best_count
 
 
-def _parse_site(data: bytes) -> list[tuple[int, str]]:
+def _parse_site(data: bytes) -> tuple[list[tuple[int, str]], dict[int, str]]:
     nodes: list[tuple[int, str]] = []
     index = 0
     while True:
@@ -88,7 +88,26 @@ def _parse_site(data: bytes) -> list[tuple[int, str]]:
         node = data[offset + 44]
         nodes.append((node, name))
         index += 1
-    return nodes
+
+    # ConfigTool stores the network zone-name table immediately after the
+    # consecutive node records. It uses the same 112-byte envelope: record
+    # class 3 at +8, signed zone number at +12, then a length-prefixed ASCII
+    # description at +16/+17.
+    zone_names: dict[int, str] = {}
+    offset = SITE_RECORD_OFFSET + len(nodes) * SITE_RECORD_SIZE
+    while offset + SITE_RECORD_SIZE <= len(data):
+        if _i32(data, offset + 8) != 3:
+            break
+        zone_number = _i32(data, offset + 12)
+        name_length = data[offset + 16]
+        if zone_number <= 0 or name_length > 80:
+            break
+        name = data[offset + 17 : offset + 17 + name_length].decode(
+            "ascii", errors="replace"
+        ).strip()
+        zone_names[zone_number] = name
+        offset += SITE_RECORD_SIZE
+    return nodes, zone_names
 
 
 def _parse_panel(node: int, name: str, data: bytes) -> Panel:
@@ -152,7 +171,7 @@ def parse_ncf(path: str | Path) -> ParsedNcf:
             raise ValueError("This archive does not contain the expected SITE record.")
         site_data = archive.read("SITE")
         versions = list(dict.fromkeys(re.findall(r"\d+\.\d+", site_data.decode("ascii", errors="ignore"))))
-        site_nodes = _parse_site(site_data)
+        site_nodes, site_zone_names = _parse_site(site_data)
 
         pcf_names = {
             Path(name).stem.casefold(): name
@@ -169,7 +188,10 @@ def parse_ncf(path: str | Path) -> ParsedNcf:
             panels.append(_parse_panel(node, panel_name, archive.read(entry_name)))
 
         zone_numbers = sorted({device.zone for panel in panels for device in panel.devices if device.zone > 0})
-        zones = [Zone(number=number) for number in zone_numbers]
+        zones = [
+            Zone(number=number, description=site_zone_names.get(number, ""))
+            for number in zone_numbers
+        ]
         entries = [
             {
                 "name": info.filename,

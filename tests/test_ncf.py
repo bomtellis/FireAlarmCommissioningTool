@@ -25,6 +25,8 @@ def test_supplied_ncf_inventory() -> None:
     assert first.zone == 179
     assert first.text == "DUCT                ROOM 4"
     assert first.observed_type == "Optical Smoke"
+    zone_179 = next(zone for zone in parsed.zones if zone.number == 179)
+    assert zone_179.description == "PATH LAB FIRST FLOOR"
 
 
 def test_multi_channel_module_is_one_physical_device() -> None:

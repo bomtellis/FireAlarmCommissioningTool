@@ -34,9 +34,26 @@ The first confirmed table in `SITE` begins at byte offset 112.
 There are 61 consecutive node records in this file. Node 52 is
 `Main Entrance Panel 1`, which agrees with `zones.csv`.
 
-The remaining bytes in each SITE record and the later SITE sections have not
-yet been assigned semantic names. They should be retained unchanged if an
-application ever writes NCF files.
+The remaining bytes in each SITE record and any fields outside the confirmed
+node and zone-name tables have not yet been assigned semantic names. They
+should be retained unchanged if an application ever writes NCF files.
+
+### SITE zone-name table
+
+The network zone-name table begins immediately after the consecutive node
+records and also uses 112-byte records.
+
+| Field | Observed location |
+|---|---:|
+| Record class | signed integer at `+8` = `3` |
+| Network zone number | signed integer at `+12` |
+| Description length | byte `+16` |
+| Zone description | ASCII at `+17`, up to 80 bytes |
+
+`Leighton-Site.NCF` contains 399 consecutive zone-name records. The importer
+uses descriptions for zones referenced by configured point records; examples
+include zone 1 `ED MAJORS GROUND FLOOR` and zone 179
+`PATH LAB FIRST FLOOR`.
 
 ## PCF point table
 

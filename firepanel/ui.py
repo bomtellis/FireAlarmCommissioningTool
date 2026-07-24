@@ -68,6 +68,12 @@ def _item(value: object, alignment: Qt.AlignmentFlag | None = None) -> QTableWid
     return result
 
 
+def _zone_label(zone) -> str:
+    number = zone["number"]
+    description = str(zone["description"] or "").strip()
+    return f"Zone {number} — {description}" if description else f"Zone {number}"
+
+
 def _device_symbol(row: dict) -> str:
     text = " ".join(
         str(row.get(key) or "") for key in ("observed_type", "text", "panel")
@@ -403,7 +409,7 @@ class ZonesMapPage(Page):
             for floor in self.repository.fetch_floors():
                 self.floor_combo.addItem(floor["name"], floor["id"])
             for zone in self.repository.fetch_zones():
-                self.zone_combo.addItem(f"Zone {zone['number']} — {zone['description']}", zone["number"])
+                self.zone_combo.addItem(_zone_label(zone), zone["number"])
                 row = self.zone_table.rowCount()
                 self.zone_table.insertRow(row)
                 for column, value in enumerate(
@@ -828,13 +834,13 @@ class RuleDialog(QDialog):
         self.repository = repository
         self.setWindowTitle("Custom cause-and-effect rule")
         form = QFormLayout(self)
-        zones = [row["number"] for row in repository.fetch_zones()]
+        zones = repository.fetch_zones()
         self.name = QLineEdit("Close straddling fire door")
         self.trigger = QComboBox()
         self.target = QComboBox()
         for zone in zones:
-            self.trigger.addItem(str(zone), zone)
-            self.target.addItem(str(zone), zone)
+            self.trigger.addItem(_zone_label(zone), zone["number"])
+            self.target.addItem(_zone_label(zone), zone["number"])
         self.relation = QComboBox()
         self.relation.addItems(["exact", "adjacent", "straddles two zones", "directly above/below"])
         self.action = QComboBox()
@@ -929,7 +935,7 @@ class TestPage(Page):
         self.scope_combo.addItem("Whole site / interpanel", None)
         if self.repository:
             for zone in self.repository.fetch_zones():
-                self.zone_combo.addItem(f"Zone {zone['number']} — {zone['description']}", zone["number"])
+                self.zone_combo.addItem(_zone_label(zone), zone["number"])
             for panel in self.repository.fetch_panels():
                 self.scope_combo.addItem(f"Node {panel['node']} — {panel['name']}", panel["node"])
         self._draw_map({})
