@@ -32,3 +32,25 @@ def test_project_import_and_duplicate_detection(tmp_path: Path) -> None:
     assert session_id == 1
     sessions = repository.fetch_test_sessions()
     assert sessions[0]["result_count"] == 1
+
+    floor_id = repository.add_floor("Ground", 0)
+    repository.place_map_asset("device", "52/1/1/1", floor_id, 125.5, -80.25, "Detector")
+    placement = repository.fetch_map_assets(floor_id)[0]
+    assert placement["entity_kind"] == "device"
+    assert placement["entity_key"] == "52/1/1/1"
+    assert placement["x"] == 125.5
+    repository.remove_map_asset("device", "52/1/1/1")
+    assert repository.fetch_map_assets(floor_id) == []
+
+    repository.add_rule(
+        "Release doors",
+        trigger_zone=179,
+        relation="exact",
+        target_zone=180,
+        target_node=52,
+        output_group=17,
+        action="CLOSE FIRE DOOR",
+    )
+    assert repository.output_group_details(17) == ("Release doors", [179])
+    repository.set_output_group_name(17, "Ward fire doors")
+    assert repository.output_group_details(17) == ("Ward fire doors", [179])

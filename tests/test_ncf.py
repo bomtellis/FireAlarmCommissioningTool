@@ -3,6 +3,7 @@ from pathlib import Path
 from firepanel.device_catalog import (
     CATALOGUE_CODES_BY_PROTOCOL,
     KNOWN_CATALOGUE_CODES,
+    catalogue_display_name,
     protocols_for_code,
 )
 from firepanel.ncf import parse_ncf
@@ -41,6 +42,8 @@ def test_supplied_protocol_catalogue_code_inventory() -> None:
         "Argus/Vega": 22,
         "Nittan": 18,
     }
-    assert len(KNOWN_CATALOGUE_CODES) == 99
+    assert len(KNOWN_CATALOGUE_CODES) == 101
     assert protocols_for_code(366) == ("Apollo",)
     assert protocols_for_code(154) == ("Apollo", "Hochiki", "Argus/Vega", "Nittan")
+    assert catalogue_display_name(18) == "Apollo XP95 Ionisation Smoke Detector"
+    assert catalogue_display_name(4) == "ConfigTool catalogue code 4"

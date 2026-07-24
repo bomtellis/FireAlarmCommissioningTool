@@ -106,6 +106,11 @@ Together they contain 99 distinct numeric product codes, 93 more than the six
 previously labelled codes. The audited sets are held in
 `firepanel/device_catalog.py`.
 
+Two further codes, `4` and `92`, are visible in the supplied ConfigTool export
+screenshots. They are recorded as known ConfigTool catalogue codes, but the
+screenshots do not contain enough context to assign a manufacturer or exact
+model name safely.
+
 Codes are not safe model identifiers on their own. For example, code `154`
 occurs in all four protocol catalogues, while other codes occur in two or three.
 The application therefore records catalogue membership separately and does not

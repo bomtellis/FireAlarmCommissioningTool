@@ -20,6 +20,28 @@ CONFIRMED_GENERIC_TYPES: dict[int, str] = {
     46: "Heat Detector",
 }
 
+# Exact Apollo picker labels matched to the sequential XP95 catalogue records
+# in apollo.NCF and the official ConfigTool 7.68 resource table.  Codes reused
+# by another protocol, or by more than one picker entry, are intentionally
+# excluded.
+CONFIRMED_PRODUCT_NAMES: dict[int, str] = {
+    18: "Apollo XP95 Ionisation Smoke Detector",
+    19: "Apollo XP95 Optical Smoke Detector",
+    20: "Apollo XP95 Heat Detector",
+    21: "Apollo XP95 High Temperature Heat Detector",
+    23: "Apollo XP95 Reflective Beam Detector",
+    24: "Apollo XP95 Flame Detector",
+    25: "Apollo XP95 Multisensor",
+    26: "Apollo XP95 High Output Loop Powered Sounder",
+    28: "Apollo XP95 Switch Monitor",
+    29: "Apollo XP95 Switch Monitor Plus",
+    31: "Apollo XP95 Mini Switch Monitor (Interrupt)",
+    36: "Apollo XP95 Radio Interface",
+    96: "Apollo XP95 DIN Sounder Circuit Controller",
+    386: "Apollo XP95 DIN Zone Monitor",
+    387: "Apollo XP95 DIN Switch Monitor",
+}
+
 
 CATALOGUE_CODES_BY_PROTOCOL: dict[str, frozenset[int]] = {
     "Apollo": frozenset(
@@ -52,7 +74,15 @@ CATALOGUE_CODES_BY_PROTOCOL: dict[str, frozenset[int]] = {
     ),
 }
 
-KNOWN_CATALOGUE_CODES = frozenset().union(*CATALOGUE_CODES_BY_PROTOCOL.values())
+# Additional codes visible in the supplied ConfigTool export screenshots.  The
+# screenshots prove catalogue membership but do not identify the protocol or
+# model name, so they remain deliberately unassigned.
+ADDITIONAL_OBSERVED_CODES = frozenset({4, 92})
+
+KNOWN_CATALOGUE_CODES = (
+    frozenset().union(*CATALOGUE_CODES_BY_PROTOCOL.values())
+    | ADDITIONAL_OBSERVED_CODES
+)
 
 
 def protocols_for_code(product_code: int) -> tuple[str, ...]:
@@ -62,3 +92,17 @@ def protocols_for_code(product_code: int) -> tuple[str, ...]:
         for protocol, codes in CATALOGUE_CODES_BY_PROTOCOL.items()
         if product_code in codes
     )
+
+
+def catalogue_display_name(product_code: int, observed_type: str | None = None) -> str:
+    """Return an honest UI/export label without inventing a product model."""
+    if observed_type:
+        return observed_type
+    if product_code in CONFIRMED_PRODUCT_NAMES:
+        return CONFIRMED_PRODUCT_NAMES[product_code]
+    protocols = protocols_for_code(product_code)
+    if protocols:
+        return f"{'/'.join(protocols)} catalogue code {product_code}"
+    if product_code in ADDITIONAL_OBSERVED_CODES:
+        return f"ConfigTool catalogue code {product_code}"
+    return f"Uncatalogued product code {product_code}"

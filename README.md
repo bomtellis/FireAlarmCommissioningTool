@@ -14,6 +14,11 @@ The application is licensed under the GNU Affero General Public License v3.0.
 - Browse nodes, loops, addresses, sub-addresses, zones and observed device types.
 - Estimate loop current and battery autonomy using editable project assumptions.
 - Import closed DXF polylines, create floors and assign shapes to zones.
+- Render the DXF as a persistent floor-plan underlay and place imported
+  detectors, call points, sounders, output devices, power supplies and panels
+  directly on it.
+- Select a placed symbol to inspect its node, zone, loop, address, sub-address
+  and any decoded output-group relationships.
 - Suggest same-floor and directly-above/below alert zones from drawing geometry.
 - Add custom rules for doors straddling zones, output groups, HVAC, lifts and
   other ancillary interfaces.

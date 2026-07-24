@@ -5,6 +5,8 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+
+from .device_catalog import catalogue_display_name
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
@@ -137,7 +139,7 @@ def export_devices_xlsx(repository: ProjectRepository, target: str | Path) -> Pa
                 row["sub_address"],
                 row["zone"],
                 row["text"],
-                row["observed_type"] or f"Product {row['product_code']}",
+                catalogue_display_name(row["product_code"], row["observed_type"]),
                 row["product_code"],
                 row["output_group"],
                 "",

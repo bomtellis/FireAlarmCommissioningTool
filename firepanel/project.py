@@ -12,7 +12,7 @@ from .models import Change, ParsedNcf
 from .ncf import parse_ncf
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS zone_geometry (
     geometry_json TEXT NOT NULL,
     source_layer TEXT,
     UNIQUE(zone, floor_id)
+);
+
+CREATE TABLE IF NOT EXISTS map_assets (
+    entity_kind TEXT NOT NULL CHECK(entity_kind IN ('device', 'panel')),
+    entity_key TEXT NOT NULL,
+    floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    symbol_type TEXT NOT NULL,
+    PRIMARY KEY (entity_kind, entity_key)
+);
+
+CREATE INDEX IF NOT EXISTS ix_map_assets_floor
+    ON map_assets(floor_id);
+
+CREATE TABLE IF NOT EXISTS output_groups (
+    number INTEGER PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS cause_effect_rules (
@@ -501,6 +519,99 @@ class ProjectRepository:
                     """
                 )
             )
+
+    def place_map_asset(
+        self,
+        entity_kind: str,
+        entity_key: str,
+        floor_id: int,
+        x: float,
+        y: float,
+        symbol_type: str,
+    ) -> None:
+        if entity_kind not in {"device", "panel"}:
+            raise ValueError(f"Unsupported map entity: {entity_kind}")
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO map_assets(entity_kind, entity_key, floor_id, x, y, symbol_type)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(entity_kind, entity_key) DO UPDATE SET
+                    floor_id=excluded.floor_id,
+                    x=excluded.x,
+                    y=excluded.y,
+                    symbol_type=excluded.symbol_type
+                """,
+                (entity_kind, entity_key, floor_id, float(x), float(y), symbol_type),
+            )
+
+    def remove_map_asset(self, entity_kind: str, entity_key: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "DELETE FROM map_assets WHERE entity_kind = ? AND entity_key = ?",
+                (entity_kind, entity_key),
+            )
+
+    def fetch_map_assets(self, floor_id: int | None = None) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            if floor_id is None:
+                return list(
+                    connection.execute(
+                        "SELECT * FROM map_assets ORDER BY floor_id, entity_kind, entity_key"
+                    )
+                )
+            return list(
+                connection.execute(
+                    """
+                    SELECT * FROM map_assets
+                    WHERE floor_id = ?
+                    ORDER BY entity_kind, entity_key
+                    """,
+                    (floor_id,),
+                )
+            )
+
+    def set_output_group_name(self, number: int, name: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO output_groups(number, name) VALUES (?, ?)
+                ON CONFLICT(number) DO UPDATE SET name=excluded.name
+                """,
+                (number, name.strip()),
+            )
+
+    def output_group_details(self, number: int) -> tuple[str, list[int]]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT name FROM output_groups WHERE number = ?", (number,)
+            ).fetchone()
+            rule_names = [
+                item["name"]
+                for item in connection.execute(
+                    """
+                    SELECT DISTINCT name
+                    FROM cause_effect_rules
+                    WHERE enabled = 1 AND output_group = ?
+                    ORDER BY name
+                    """,
+                    (number,),
+                )
+            ]
+            zones = [
+                int(item["trigger_zone"])
+                for item in connection.execute(
+                    """
+                    SELECT DISTINCT trigger_zone
+                    FROM cause_effect_rules
+                    WHERE enabled = 1 AND output_group = ? AND trigger_zone IS NOT NULL
+                    ORDER BY trigger_zone
+                    """,
+                    (number,),
+                )
+            ]
+        name = row["name"] if row and row["name"] else " / ".join(rule_names)
+        return (name, zones)
 
     def replace_suggested_rules(self, rows: Iterable[tuple]) -> None:
         with self.connection() as connection:
