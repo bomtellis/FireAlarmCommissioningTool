@@ -87,6 +87,32 @@ Confirmed product-code mappings from that comparison:
 Other product codes occur in the full network and still need authoritative
 labels or additional ConfigTool exports.
 
+## Protocol catalogue files
+
+Four ConfigTool 7.68 catalogue configurations were added on 24 July 2026.
+They contain blank device text, so they prove which numeric codes occur but do
+not directly store the picker/model name. Static inspection of the official
+ConfigTool resources confirms that the picker includes the corresponding
+Apollo, Hochiki, Argus/Vega and Nittan product ranges.
+
+| File | Catalogue | Physical devices | Point/sub-point records | Distinct codes |
+|---|---|---:|---:|---:|
+| `apollo.NCF` | Apollo | 109 | 142 | 63 |
+| `hokiko.NCF` | Hochiki | 43 | 103 | 29 |
+| `AV.NCF` | Argus/Vega | 109 | 111 | 22 |
+| `nittan.NCF` | Nittan | 41 | 70 | 18 |
+
+Together they contain 99 distinct numeric product codes, 93 more than the six
+previously labelled codes. The audited sets are held in
+`firepanel/device_catalog.py`.
+
+Codes are not safe model identifiers on their own. For example, code `154`
+occurs in all four protocol catalogues, while other codes occur in two or three.
+The application therefore records catalogue membership separately and does not
+invent a manufacturer/model label. Protocol-specific names should only be
+enabled after the PCF panel-protocol field is decoded or after a ConfigTool
+device export supplies an authoritative code/name join.
+
 ## Current network totals
 
 The read-only scan finds:

@@ -1,5 +1,10 @@
 from pathlib import Path
 
+from firepanel.device_catalog import (
+    CATALOGUE_CODES_BY_PROTOCOL,
+    KNOWN_CATALOGUE_CODES,
+    protocols_for_code,
+)
 from firepanel.ncf import parse_ncf
 
 
@@ -27,3 +32,15 @@ def test_multi_channel_module_is_one_physical_device() -> None:
     module = next(device for device in node_52.devices if device.loop == 1 and device.address == 41)
     assert len(module.channels) == 3
     assert [channel.sub_address for channel in module.channels] == [1, 2, 3]
+
+
+def test_supplied_protocol_catalogue_code_inventory() -> None:
+    assert {name: len(codes) for name, codes in CATALOGUE_CODES_BY_PROTOCOL.items()} == {
+        "Apollo": 63,
+        "Hochiki": 29,
+        "Argus/Vega": 22,
+        "Nittan": 18,
+    }
+    assert len(KNOWN_CATALOGUE_CODES) == 99
+    assert protocols_for_code(366) == ("Apollo",)
+    assert protocols_for_code(154) == ("Apollo", "Hochiki", "Argus/Vega", "Nittan")

@@ -7,23 +7,17 @@ import zipfile
 from collections import OrderedDict
 from pathlib import Path
 
+from .device_catalog import (
+    CONFIRMED_GENERIC_TYPES,
+    KNOWN_CATALOGUE_CODES,
+    protocols_for_code,
+)
 from .models import Device, DeviceChannel, Panel, ParsedNcf, Zone
 
 
 POINT_RECORD_SIZE = 224
 SITE_RECORD_OFFSET = 112
 SITE_RECORD_SIZE = 112
-
-# Confirmed against the supplied ConfigTool zone export for network node 52.
-OBSERVED_TYPES: dict[int, str] = {
-    6: "Call Point",
-    33: "Relay",
-    38: "Relay",
-    40: "Sounder",
-    45: "Optical Smoke",
-    46: "Heat Detector",
-}
-
 
 def _i32(data: bytes, offset: int) -> int:
     return struct.unpack_from("<i", data, offset)[0]
@@ -111,7 +105,7 @@ def _parse_panel(node: int, name: str, data: bytes) -> Panel:
             text = data[offset + 21 : offset + 21 + text_length].decode("ascii", errors="replace").rstrip()
             zone = _i32(data, offset + 48)
             product_code = _i32(data, offset + 12)
-            observed_type = OBSERVED_TYPES.get(product_code)
+            observed_type = CONFIRMED_GENERIC_TYPES.get(product_code)
             channel = DeviceChannel(
                 sub_address=sub_address,
                 text=text,
@@ -185,17 +179,37 @@ def parse_ncf(path: str | Path) -> ParsedNcf:
             for info in archive.infolist()
         ]
 
+    unlabelled_catalogue_codes = sorted(
+        {
+            device.product_code
+            for panel in panels
+            for device in panel.devices
+            if device.observed_type is None
+            and device.product_code in KNOWN_CATALOGUE_CODES
+        }
+    )
     unknown_codes = sorted(
         {
             device.product_code
             for panel in panels
             for device in panel.devices
             if device.observed_type is None
+            and device.product_code not in KNOWN_CATALOGUE_CODES
         }
     )
+    if unlabelled_catalogue_codes:
+        details = ", ".join(
+            f"{code} ({'/'.join(protocols_for_code(code))})"
+            for code in unlabelled_catalogue_codes
+        )
+        warnings.append(
+            "Recognised ConfigTool catalogue codes awaiting protocol-specific "
+            f"model labels: {details}"
+        )
     if unknown_codes:
         warnings.append(
-            "Product codes without confirmed labels: " + ", ".join(str(value) for value in unknown_codes)
+            "Product codes not present in the supplied catalogues: "
+            + ", ".join(str(value) for value in unknown_codes)
         )
     warnings.append(
         "Output-group and proprietary cause/effect fields are not yet decoded; "
