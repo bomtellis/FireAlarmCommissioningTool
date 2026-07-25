@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, QRectF, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QAction, QColor, QBrush, QCursor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDialog,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -44,28 +47,436 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .device_catalog import catalogue_display_name
-from .dxf import DxfShape, read_closed_shapes, read_linework
-from .exports import export_change_pdf, export_devices_xlsx
+from .cause_effect import normalise_zone_key
+from .device_catalog import catalogue_display_name, device_current_ma
+from .dxf import DxfShape, read_closed_shapes, read_layers, read_linework, read_text
+from .exports import (
+    export_cause_effect_comparison_xlsx,
+    export_change_pdf,
+    export_devices_xlsx,
+)
 from .project import ProjectRepository
 from .rules import evaluate_zone, generate_htm_rules
 from .styles import APP_STYLESHEET
+from .testing_workbook import export_testing_workbook, read_testing_workbook
 
 
-CURRENT_MA = {
-    "Optical Smoke": 0.50,
-    "Heat Detector": 0.50,
-    "Call Point": 0.25,
-    "Relay": 1.50,
-    "Sounder": 0.30,
-}
+CONFIGURATION_FILTER = "Network configurations (*.ncf *.NCF *.skf *.SKF)"
+
+
+def natural_sort_key(value: object) -> tuple[tuple[int, object], ...]:
+    """Return a key that sorts embedded numbers numerically and text naturally."""
+    text = "" if value is None else str(value).strip()
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return ((0, float(text)),)
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", text)
+        if part
+    )
+
+
+class NaturalSortTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        return natural_sort_key(self.text()) < natural_sort_key(other.text())
+
+
+class FilterableTableWidget(QTableWidget):
+    """QTableWidget with natural sorting and a filter on every column header."""
+
+    def __init__(self, rows: int, columns: int, parent: QWidget | None = None):
+        super().__init__(rows, columns, parent)
+        self._base_headers: list[str] = []
+        self._column_filters: dict[int, str] = {}
+        header = self.horizontalHeader()
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_filter_menu)
+        header.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        header.setToolTip(
+            "Click a column heading to sort. Right-click a heading to filter that column."
+        )
+
+    def setHorizontalHeaderLabels(self, labels) -> None:
+        self._base_headers = [str(label) for label in labels]
+        self._update_header_labels()
+
+    def setItem(self, row: int, column: int, item: QTableWidgetItem) -> None:
+        super().setItem(row, column, item)
+        if self._column_filters:
+            self.setRowHidden(row, not self._row_matches_filters(row))
+
+    def set_column_filter(self, column: int, value: str) -> None:
+        value = value.strip()
+        if value:
+            self._column_filters[column] = value.casefold()
+        else:
+            self._column_filters.pop(column, None)
+        self._update_header_labels()
+        self.apply_filters()
+
+    def clear_filters(self) -> None:
+        self._column_filters.clear()
+        self._update_header_labels()
+        self.apply_filters()
+
+    def apply_filters(self) -> None:
+        for row in range(self.rowCount()):
+            self.setRowHidden(row, not self._row_matches_filters(row))
+
+    def _row_matches_filters(self, row: int) -> bool:
+        for column, needle in self._column_filters.items():
+            item = self.item(row, column)
+            if item is None or needle not in item.text().casefold():
+                return False
+        return True
+
+    def _update_header_labels(self) -> None:
+        labels = [
+            f"{label}  [filter]" if column in self._column_filters else f"{label}  \u25be"
+            for column, label in enumerate(self._base_headers)
+        ]
+        super().setHorizontalHeaderLabels(labels)
+
+    def _show_filter_menu(self, position) -> None:
+        column = self.horizontalHeader().logicalIndexAt(position)
+        if column < 0:
+            return
+        label = (
+            self._base_headers[column]
+            if column < len(self._base_headers)
+            else f"Column {column + 1}"
+        )
+        menu = QMenu(self)
+        filter_action = menu.addAction(f"Filter {label}\u2026")
+        clear_action = menu.addAction(f"Clear {label} filter")
+        clear_action.setEnabled(column in self._column_filters)
+        clear_all_action = menu.addAction("Clear all column filters")
+        clear_all_action.setEnabled(bool(self._column_filters))
+        chosen = menu.exec(self.horizontalHeader().mapToGlobal(position))
+        if chosen == filter_action:
+            value, accepted = QInputDialog.getText(
+                self,
+                f"Filter {label}",
+                "Show rows containing:",
+                text=self._column_filters.get(column, ""),
+            )
+            if accepted:
+                self.set_column_filter(column, value)
+        elif chosen == clear_action:
+            self.set_column_filter(column, "")
+        elif chosen == clear_all_action:
+            self.clear_filters()
 
 
 def _item(value: object, alignment: Qt.AlignmentFlag | None = None) -> QTableWidgetItem:
-    result = QTableWidgetItem("" if value is None else str(value))
+    result = NaturalSortTableWidgetItem("" if value is None else str(value))
     if alignment is not None:
         result.setTextAlignment(alignment)
     return result
+
+
+class CauseEffectMatrixWidget(QWidget):
+    """Complete imported matrix with an optional target-node column filter."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 0)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Show node"))
+        self.node_filter = QComboBox()
+        self.node_filter.setMinimumWidth(360)
+        self.node_filter.currentIndexChanged.connect(self._apply_node_filter)
+        controls.addWidget(self.node_filter)
+        self.summary = QLabel()
+        controls.addWidget(self.summary)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.zone_table = QTableWidget()
+        self.zone_table.setObjectName("causeEffectFrozenZones")
+        self.zone_table.setColumnCount(1)
+        self.zone_table.setHorizontalHeaderLabels(["Trigger zone"])
+        self.zone_table.setAlternatingRowColors(True)
+        self.zone_table.setWordWrap(True)
+        self.zone_table.setSortingEnabled(False)
+        self.zone_table.verticalHeader().setVisible(False)
+        self.zone_table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.zone_table.horizontalHeader().setMinimumHeight(82)
+        self.zone_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.zone_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.zone_table.setColumnWidth(0, 278)
+
+        self.table = QTableWidget()
+        self.table.setObjectName("causeEffectMatrix")
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
+        self.table.setSortingEnabled(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.table.horizontalHeader().setMinimumHeight(82)
+
+        panes = QHBoxLayout()
+        panes.setContentsMargins(0, 0, 0, 0)
+        panes.setSpacing(0)
+        frozen_pane = QWidget()
+        frozen_layout = QVBoxLayout(frozen_pane)
+        frozen_layout.setContentsMargins(0, 0, 0, 0)
+        frozen_layout.setSpacing(0)
+        frozen_layout.addWidget(self.zone_table, 1)
+        scrollbar_spacer = QWidget()
+        scrollbar_spacer.setFixedHeight(
+            self.table.horizontalScrollBar().sizeHint().height()
+        )
+        frozen_layout.addWidget(scrollbar_spacer)
+        frozen_pane.setFixedWidth(280)
+        panes.addWidget(frozen_pane)
+        panes.addWidget(self.table, 1)
+        layout.addLayout(panes, 1)
+
+        self.table.verticalScrollBar().valueChanged.connect(
+            self.zone_table.verticalScrollBar().setValue
+        )
+        self.zone_table.verticalScrollBar().valueChanged.connect(
+            self.table.verticalScrollBar().setValue
+        )
+        self.set_activations([])
+
+    def set_activations(self, activations, output_groups=()) -> None:
+        rows = list(activations)
+        imported_outputs = list(output_groups)
+        self.node_filter.blockSignals(True)
+        self.node_filter.clear()
+        self.node_filter.addItem("All nodes", None)
+        self.zone_table.clearContents()
+        self.zone_table.setRowCount(0)
+        self.table.clear()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(0)
+
+        if not rows:
+            self.node_filter.setEnabled(False)
+            self.summary.setText(
+                "Import a Cause & Effect workbook to populate the matrix."
+            )
+            self.node_filter.blockSignals(False)
+            return
+
+        node_names: dict[int, str] = {}
+        for output in imported_outputs:
+            node = int(output["target_node"])
+            name = str(output["target_node_name"] or "").strip()
+            if node not in node_names or (name and not node_names[node]):
+                node_names[node] = name
+        for activation in rows:
+            node = int(activation["target_node"])
+            name = str(activation["target_node_name"] or "").strip()
+            if node not in node_names or (name and not node_names[node]):
+                node_names[node] = name
+        for node in sorted(node_names):
+            label = f"Node {node}"
+            if node_names[node]:
+                label += f" - {node_names[node]}"
+            self.node_filter.addItem(label, node)
+        self.node_filter.setEnabled(True)
+        self._populate_table(rows, node_names, imported_outputs)
+        self.node_filter.setCurrentIndex(0)
+        self.node_filter.blockSignals(False)
+        self._apply_node_filter()
+
+    def _populate_table(
+        self,
+        activations,
+        node_names: dict[int, str],
+        imported_outputs,
+    ) -> None:
+        output_names: dict[tuple[int, int], str] = {}
+        zone_names: dict[str, str] = {}
+        cells: dict[tuple[str, int, int], dict[str, object]] = {}
+
+        for output in imported_outputs:
+            key = (
+                int(output["target_node"]),
+                int(output["output_group"]),
+            )
+            output_names[key] = str(
+                output["output_group_name"] or ""
+            ).strip()
+
+        for activation in activations:
+            node = int(activation["target_node"])
+            output_group = int(activation["output_group"])
+            output_name = str(activation["output_group_name"] or "").strip()
+            output_key = (node, output_group)
+            if output_key not in output_names or (
+                output_name and not output_names[output_key]
+            ):
+                output_names[output_key] = output_name
+
+            trigger_zone = str(activation["trigger_zone"] or "").strip()
+            trigger_name = str(activation["trigger_zone_name"] or "").strip()
+            if trigger_zone not in zone_names or (
+                trigger_name and not zone_names[trigger_zone]
+            ):
+                zone_names[trigger_zone] = trigger_name
+
+            cell = cells.setdefault(
+                (trigger_zone, node, output_group),
+                {
+                    "styles": [],
+                    "matrix_only": False,
+                    "comments": [],
+                },
+            )
+            ringing_style = str(activation["ringing_style"] or "").strip()
+            styles = cell["styles"]
+            if ringing_style and ringing_style not in styles:
+                styles.append(ringing_style)
+            if activation["reference_status"] != "matched":
+                cell["matrix_only"] = True
+            comments = str(activation["comments"] or "").strip()
+            saved_comments = cell["comments"]
+            if comments and comments not in saved_comments:
+                saved_comments.append(comments)
+
+        output_groups = sorted(output_names)
+        trigger_zones = sorted(zone_names, key=natural_sort_key)
+        self.zone_table.setRowCount(len(trigger_zones))
+        self.table.setRowCount(len(trigger_zones))
+        self.table.setColumnCount(len(output_groups))
+
+        headers = []
+        for node, output_group in output_groups:
+            node_label = f"Node {node}"
+            if node_names.get(node):
+                node_label += f" - {node_names[node]}"
+            output_name = output_names[(node, output_group)]
+            header = f"{node_label}\nOutput group {output_group}"
+            if output_name:
+                header += f"\n{output_name}"
+            headers.append(header)
+        self.table.setHorizontalHeaderLabels(headers)
+        for column, (node, output_group) in enumerate(output_groups):
+            header_item = self.table.horizontalHeaderItem(column)
+            header_item.setData(
+                Qt.ItemDataRole.UserRole,
+                node,
+            )
+            header_item.setData(
+                Qt.ItemDataRole.UserRole + 1,
+                output_group,
+            )
+
+        for column in range(self.table.columnCount()):
+            self.table.setColumnWidth(column, 210)
+
+        for row, trigger_zone in enumerate(trigger_zones):
+            trigger_name = zone_names[trigger_zone]
+            label = f"Zone {trigger_zone}"
+            if trigger_name:
+                label += f" - {trigger_name}"
+            zone_item = _item(label)
+            zone_item.setData(Qt.ItemDataRole.UserRole, trigger_zone)
+            zone_item.setFlags(zone_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            zone_item.setBackground(QColor("#e9eff7"))
+            self.zone_table.setItem(row, 0, zone_item)
+
+            for column, (node, output_group) in enumerate(
+                output_groups,
+            ):
+                cell = cells.get((trigger_zone, node, output_group))
+                if not cell:
+                    continue
+                styles = cell["styles"]
+                style_text = " / ".join(styles)
+                item = _item(style_text, Qt.AlignmentFlag.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                status = "Matrix only" if cell["matrix_only"] else "Matched"
+                tooltip = (
+                    f"{label}\n"
+                    f"Node {node}"
+                    f"{' - ' + node_names[node] if node_names.get(node) else ''}\n"
+                    f"Output group {output_group}"
+                    f"{' - ' + output_names[(node, output_group)] if output_names[(node, output_group)] else ''}\n"
+                    f"Ringing style: {style_text or 'Not specified'}\n"
+                    f"Reference check: {status}"
+                )
+                if cell["comments"]:
+                    tooltip += "\nComments: " + " | ".join(cell["comments"])
+                item.setToolTip(tooltip)
+                if cell["matrix_only"]:
+                    item.setBackground(QColor("#fff3cd"))
+                self.table.setItem(row, column, item)
+
+        self.zone_table.resizeRowsToContents()
+        self.table.resizeRowsToContents()
+        for row in range(len(trigger_zones)):
+            height = max(
+                self.zone_table.rowHeight(row),
+                self.table.rowHeight(row),
+            )
+            self.zone_table.setRowHeight(row, height)
+            self.table.setRowHeight(row, height)
+        self.summary.setText(
+            f"{len(node_names):,} nodes; {len(output_groups):,} output groups"
+        )
+
+    def _apply_node_filter(self) -> None:
+        selected_node = self.node_filter.currentData()
+        visible_outputs = 0
+        for column in range(self.table.columnCount()):
+            header_item = self.table.horizontalHeaderItem(column)
+            column_node = (
+                header_item.data(Qt.ItemDataRole.UserRole)
+                if header_item is not None
+                else None
+            )
+            hidden = (
+                selected_node is not None
+                and int(column_node) != int(selected_node)
+            )
+            self.table.setColumnHidden(column, hidden)
+            if not hidden:
+                visible_outputs += 1
+        if self.node_filter.isEnabled():
+            if selected_node is None:
+                node_count = self.node_filter.count() - 1
+                self.summary.setText(
+                    f"{node_count:,} nodes; {visible_outputs:,} output groups"
+                )
+            else:
+                self.summary.setText(
+                    f"Node {int(selected_node)}; "
+                    f"{visible_outputs:,} output groups"
+                )
+
+
+def node_current_totals(devices) -> tuple[int, float, float]:
+    """Count physical devices and total their quiescent/alarm draw in mA."""
+    physical_devices: dict[tuple[int, int], list[object]] = defaultdict(list)
+    for device in devices:
+        physical_devices[(device["loop"], device["address"])].append(device)
+    quiescent_ma = 0.0
+    alarm_ma = 0.0
+    for channels in physical_devices.values():
+        draws = [
+            device_current_ma(channel["observed_type"])
+            for channel in channels
+        ]
+        # Multi-channel modules are one physical loop device. Use the largest
+        # applicable draw rather than counting every channel.
+        quiescent_ma += max(draw[0] for draw in draws)
+        alarm_ma += max(draw[1] for draw in draws)
+    return len(physical_devices), quiescent_ma, alarm_ma
 
 
 def _zone_label(zone) -> str:
@@ -106,13 +517,177 @@ SYMBOL_COLOURS = {
 
 class MapGraphicsView(QGraphicsView):
     scene_clicked = Signal(QPointF)
+    scene_right_clicked = Signal(object, QPointF)
+    scene_double_clicked = Signal(QPointF)
+    item_moved = Signal(object)
+    drawing_cancelled = Signal()
+    drawing_undo_requested = Signal()
+    drawing_finish_requested = Signal()
+    polygon_selection_requested = Signal(QPointF)
+
+    def __init__(self, scene: QGraphicsScene, parent: QWidget | None = None):
+        super().__init__(scene, parent)
+        self.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        )
+        self._pan_button: Qt.MouseButton | None = None
+        self._pan_start = None
+        self._pan_last = None
+        self._pan_dragged = False
+        self._press_item = None
+        self._moving_item = None
+        self.draw_mode = False
+        self.edit_geometry_mode = False
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            item = self.itemAt(event.position().toPoint())
-            if item is None or item.data(10) is None:
-                self.scene_clicked.emit(self.mapToScene(event.position().toPoint()))
+        point = event.position().toPoint()
+        if self.draw_mode:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.scene_clicked.emit(self.mapToScene(point))
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                self.scene_double_clicked.emit(self.mapToScene(point))
+                event.accept()
+                return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.scene_right_clicked.emit(
+                self.itemAt(point),
+                self.mapToScene(point),
+            )
+            event.accept()
+            return
+        if event.button() in {
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.MiddleButton,
+        }:
+            pressed_item = self.itemAt(point)
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self.edit_geometry_mode
+                and pressed_item is not None
+                and pressed_item.data(30) is not None
+            ):
+                self._moving_item = pressed_item
+                super().mousePressEvent(event)
+                return
+            self._pan_button = event.button()
+            self._pan_start = point
+            self._pan_last = point
+            self._pan_dragged = False
+            self._press_item = pressed_item
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._pan_button is not None
+            and self._pan_last is not None
+            and not self.draw_mode
+        ):
+            point = event.position().toPoint()
+            if (
+                not self._pan_dragged
+                and self._pan_start is not None
+                and (point - self._pan_start).manhattanLength()
+                >= QApplication.startDragDistance()
+            ):
+                self._pan_dragged = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._pan_dragged:
+                delta = point - self._pan_last
+                self.horizontalScrollBar().setValue(
+                    self.horizontalScrollBar().value() - delta.x()
+                )
+                self.verticalScrollBar().setValue(
+                    self.verticalScrollBar().value() - delta.y()
+                )
+                self._pan_last = point
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.draw_mode and event.button() in {
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.RightButton,
+        }:
+            event.accept()
+            return
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._moving_item is not None
+        ):
+            moved_item = self._moving_item
+            self._moving_item = None
+            super().mouseReleaseEvent(event)
+            self.item_moved.emit(moved_item)
+            return
+        if event.button() == self._pan_button:
+            point = event.position().toPoint()
+            was_dragged = self._pan_dragged
+            pressed_item = self._press_item
+            self._pan_button = None
+            self._pan_start = None
+            self._pan_last = None
+            self._pan_dragged = False
+            self._press_item = None
+            self.unsetCursor()
+            if was_dragged:
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.MiddleButton:
+                event.accept()
+                return
+            if pressed_item is None or pressed_item.data(10) is None:
+                self.scene_clicked.emit(self.mapToScene(point))
+            polygon_click = (
+                pressed_item is not None
+                and pressed_item.data(10) is None
+            )
+            super().mouseReleaseEvent(event)
+            if polygon_click:
+                self.polygon_selection_requested.emit(
+                    self.mapToScene(point)
+                )
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self.draw_mode and event.button() == Qt.MouseButton.LeftButton:
+            self.scene_double_clicked.emit(
+                self.mapToScene(event.position().toPoint())
+            )
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        factor = 1.18 if event.angleDelta().y() > 0 else 1 / 1.18
+        self.scale(factor, factor)
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        if self.draw_mode:
+            if event.key() in {
+                Qt.Key.Key_Return,
+                Qt.Key.Key_Enter,
+            }:
+                self.drawing_finish_requested.emit()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self.drawing_cancelled.emit()
+                event.accept()
+                return
+            if event.key() in {Qt.Key.Key_Backspace, Qt.Key.Key_Delete}:
+                self.drawing_undo_requested.emit()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class Page(QWidget):
@@ -202,7 +777,7 @@ class DevicesPage(Page):
             "Node", "Panel", "Loop", "Address", "Sub address", "Zone",
             "Device text", "Type", "Product", "Output group",
         ]
-        self.table = QTableWidget(0, len(headers))
+        self.table = FilterableTableWidget(0, len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
@@ -233,6 +808,33 @@ class DevicesPage(Page):
         self.table.setSortingEnabled(True)
 
 
+class ZonesPage(Page):
+    def __init__(self):
+        super().__init__("Zones")
+        self.table = FilterableTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(
+            ["Zone number", "Zone description", "Devices"]
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setColumnWidth(1, 520)
+        self.layout.addWidget(self.table, 1)
+
+    def refresh(self) -> None:
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        if self.repository:
+            for zone in self.repository.fetch_zones():
+                row_index = self.table.rowCount()
+                self.table.insertRow(row_index)
+                for column, value in enumerate(
+                    [zone["number"], zone["description"], zone["device_count"]]
+                ):
+                    self.table.setItem(row_index, column, _item(value))
+        self.table.setSortingEnabled(True)
+        self.table.apply_filters()
+
+
 class NodesPage(Page):
     def __init__(self):
         super().__init__("Nodes and power")
@@ -242,11 +844,12 @@ class NodesPage(Page):
         )
         note.setWordWrap(True)
         self.layout.addWidget(note)
-        self.table = QTableWidget(0, 10)
+        self.table = FilterableTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
             [
-                "Node", "Panel", "Loops", "Devices", "Expected loop mA",
-                "Battery Ah", "Standby h", "Alarm min", "Required Ah", "Autonomy check",
+                "Node", "Panel", "Loops", "Devices", "Quiescent draw mA",
+                "Alarm draw mA", "Battery Ah", "Standby h", "Alarm min",
+                "Required Ah", "Autonomy check",
             ]
         )
         self.table.setAlternatingRowColors(True)
@@ -258,39 +861,43 @@ class NodesPage(Page):
         self.layout.addWidget(button)
 
     def refresh(self) -> None:
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         if not self.repository:
             return
         power = self.repository.fetch_node_power()
-        devices_by_node: dict[int, dict[tuple[int, int], object]] = defaultdict(dict)
+        devices_by_node: dict[int, list[object]] = defaultdict(list)
         for device in self.repository.fetch_devices():
-            devices_by_node[device["node"]][(device["loop"], device["address"])] = device
+            devices_by_node[device["node"]].append(device)
         for panel in self.repository.fetch_panels():
             node = panel["node"]
-            unique = devices_by_node[node]
-            expected_ma = sum(CURRENT_MA.get(row["observed_type"], 0.75) for row in unique.values())
+            device_count, quiescent_ma, alarm_ma = node_current_totals(
+                devices_by_node[node]
+            )
             settings = power.get(node)
             battery = settings["battery_ah"] if settings else None
             standby = settings["standby_hours"] if settings else 24.0
             alarm_minutes = settings["alarm_minutes"] if settings else 30.0
             factor = settings["safety_factor"] if settings else 1.25
-            alarm_a = sum(
-                0.020 if row["observed_type"] == "Sounder" else CURRENT_MA.get(row["observed_type"], 0.75) / 1000
-                for row in unique.values()
-            )
-            required = ((expected_ma / 1000) * standby + alarm_a * (alarm_minutes / 60)) * factor
+            required = (
+                (quiescent_ma / 1000) * standby
+                + (alarm_ma / 1000) * (alarm_minutes / 60)
+            ) * factor
             status = "Enter battery"
             if battery is not None:
                 status = "PASS (estimate)" if battery >= required else "REVIEW"
             row_index = self.table.rowCount()
             self.table.insertRow(row_index)
             values = [
-                node, panel["name"], panel["loops_json"], len(unique), f"{expected_ma:.1f}",
+                node, panel["name"], panel["loops_json"], device_count,
+                f"{quiescent_ma:.1f}", f"{alarm_ma:.1f}",
                 "" if battery is None else f"{battery:.1f}", f"{standby:.1f}",
                 f"{alarm_minutes:.0f}", f"{required:.1f}", status,
             ]
             for column, value in enumerate(values):
                 self.table.setItem(row_index, column, _item(value))
+        self.table.setSortingEnabled(True)
+        self.table.apply_filters()
 
     def set_power(self) -> None:
         if not self.repository or self.table.currentRow() < 0:
@@ -342,7 +949,7 @@ class OutputGroupDevicesDialog(QDialog):
         heading = QLabel(f"<b>Node {node} — {panel}</b><br>{label}")
         layout.addWidget(heading)
         rows = repository.fetch_output_group_devices(node, output_group)
-        table = QTableWidget(0, 9)
+        table = FilterableTableWidget(0, 9)
         table.setHorizontalHeaderLabels(
             [
                 "Loop", "Address", "Sub address", "Zone", "Device text",
@@ -371,6 +978,8 @@ class OutputGroupDevicesDialog(QDialog):
             ]
             for column, value in enumerate(values):
                 table.setItem(row_index, column, _item(value))
+        table.setSortingEnabled(True)
+        table.apply_filters()
         layout.addWidget(table, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -386,7 +995,7 @@ class OutputGroupsPage(Page):
         )
         note.setWordWrap(True)
         self.layout.addWidget(note)
-        self.table = QTableWidget(0, 6)
+        self.table = FilterableTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["Node", "Panel", "Output group", "Group name", "Devices", "Ringing styles"]
         )
@@ -447,6 +1056,118 @@ class OutputGroupsPage(Page):
         ).exec()
 
 
+class ZoneSelectionDialog(QDialog):
+    def __init__(
+        self,
+        zones: list[tuple[str, object]],
+        current_zone: object | None = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Select zone")
+        self.resize(560, 480)
+        layout = QVBoxLayout(self)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Type a zone number or description…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.search)
+        self.zone_list = QListWidget()
+        for label, value in zones:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, value)
+            self.zone_list.addItem(item)
+            if current_zone is not None and value == current_zone:
+                self.zone_list.setCurrentItem(item)
+        self.zone_list.itemDoubleClicked.connect(lambda _item: self.accept())
+        layout.addWidget(self.zone_list, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_selection)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.search.setFocus()
+
+    def selected_zone(self):
+        item = self.zone_list.currentItem()
+        return (
+            item.data(Qt.ItemDataRole.UserRole)
+            if item is not None
+            else None
+        )
+
+    def _filter(self, text: str) -> None:
+        query = text.strip().casefold()
+        first_visible = None
+        current_visible = False
+        for index in range(self.zone_list.count()):
+            item = self.zone_list.item(index)
+            visible = not query or query in item.text().casefold()
+            item.setHidden(not visible)
+            if visible and first_visible is None:
+                first_visible = item
+            if visible and item is self.zone_list.currentItem():
+                current_visible = True
+        if not current_visible:
+            self.zone_list.setCurrentItem(first_visible)
+
+    def _accept_selection(self) -> None:
+        if self.selected_zone() is None:
+            QMessageBox.information(
+                self,
+                "Select a zone",
+                "Select a zone from the filtered list.",
+            )
+            return
+        self.accept()
+
+
+class PolygonSelectionDialog(QDialog):
+    def __init__(
+        self,
+        polygons: list[tuple[str, QGraphicsPolygonItem]],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Select overlapping polygon")
+        self.resize(560, 360)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Multiple zone polygons overlap at this position. Select the one "
+            "you want to work with."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.polygon_list = QListWidget()
+        for label, polygon in polygons:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, polygon)
+            self.polygon_list.addItem(item)
+        if self.polygon_list.count():
+            self.polygon_list.setCurrentRow(0)
+        self.polygon_list.itemDoubleClicked.connect(
+            lambda _item: self.accept()
+        )
+        layout.addWidget(self.polygon_list, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_polygon(self) -> QGraphicsPolygonItem | None:
+        item = self.polygon_list.currentItem()
+        return (
+            item.data(Qt.ItemDataRole.UserRole)
+            if item is not None
+            else None
+        )
+
+
 class ZonesMapPage(Page):
     geometry_changed = Signal()
 
@@ -454,9 +1175,37 @@ class ZonesMapPage(Page):
         super().__init__("Site drawings and zones")
         controls = QHBoxLayout()
         self.floor_combo = QComboBox()
-        self.floor_combo.currentIndexChanged.connect(self.refresh_scene)
+        self.floor_combo.currentIndexChanged.connect(self.floor_changed)
         import_button = QPushButton("Import floor DXF")
         import_button.clicked.connect(self.import_dxf)
+        replace_dxf_button = QPushButton("Replace DXF")
+        replace_dxf_button.setProperty("secondary", True)
+        replace_dxf_button.clicked.connect(self.replace_dxf)
+        remove_dxf_button = QPushButton("Remove DXF")
+        remove_dxf_button.setProperty("secondary", True)
+        remove_dxf_button.clicked.connect(self.remove_dxf)
+        self.draw_polygon_button = QPushButton("Draw zone polyline")
+        self.draw_polygon_button.setCheckable(True)
+        self.draw_polygon_button.setProperty("secondary", True)
+        self.draw_polygon_button.toggled.connect(self.set_draw_mode)
+        self.finish_polygon_button = QPushButton("Finish polygon")
+        self.finish_polygon_button.setProperty("secondary", True)
+        self.finish_polygon_button.setEnabled(False)
+        self.finish_polygon_button.clicked.connect(
+            lambda: self.finish_drawn_polygon()
+        )
+        self.undo_polygon_button = QPushButton("Undo point")
+        self.undo_polygon_button.setProperty("secondary", True)
+        self.undo_polygon_button.setEnabled(False)
+        self.undo_polygon_button.clicked.connect(self.undo_draw_point)
+        self.cancel_polygon_button = QPushButton("Cancel drawing")
+        self.cancel_polygon_button.setProperty("secondary", True)
+        self.cancel_polygon_button.setEnabled(False)
+        self.cancel_polygon_button.clicked.connect(self.cancel_drawing)
+        self.move_polygon_button = QPushButton("Move polygons")
+        self.move_polygon_button.setCheckable(True)
+        self.move_polygon_button.setProperty("secondary", True)
+        self.move_polygon_button.toggled.connect(self.set_move_mode)
         self.zone_combo = QComboBox()
         self.zone_combo.setMinimumWidth(330)
         self.zone_combo.view().setMinimumWidth(520)
@@ -465,21 +1214,60 @@ class ZonesMapPage(Page):
         controls.addWidget(QLabel("Floor"))
         controls.addWidget(self.floor_combo)
         controls.addWidget(import_button)
+        controls.addWidget(replace_dxf_button)
+        controls.addWidget(remove_dxf_button)
+        controls.addWidget(self.draw_polygon_button)
+        controls.addWidget(self.finish_polygon_button)
+        controls.addWidget(self.undo_polygon_button)
+        controls.addWidget(self.cancel_polygon_button)
+        controls.addWidget(self.move_polygon_button)
         controls.addStretch()
         controls.addWidget(self.zone_combo)
         controls.addWidget(assign_button)
         self.layout.addLayout(controls)
+        navigation_hint = QLabel(
+            "Mouse: wheel to zoom · middle-drag or left-drag to pan · "
+            "right-click a polygon to assign, reassign, rotate, realign or "
+            "unassign it. In draw mode, click each corner and double-click to finish."
+        )
+        navigation_hint.setWordWrap(True)
+        self.layout.addWidget(navigation_hint)
         splitter = QSplitter()
         self.scene = QGraphicsScene()
         self.view = MapGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.scene_clicked.connect(self.place_selected)
+        self.view.scene_right_clicked.connect(self.assign_shape_from_context)
+        self.view.scene_double_clicked.connect(self.finish_drawn_polygon)
+        self.view.item_moved.connect(self.geometry_item_moved)
+        self.view.drawing_cancelled.connect(self.cancel_drawing)
+        self.view.drawing_undo_requested.connect(self.undo_draw_point)
+        self.view.drawing_finish_requested.connect(
+            lambda: self.finish_drawn_polygon()
+        )
+        self.view.polygon_selection_requested.connect(
+            self.select_polygon_at_point
+        )
         self.scene.selectionChanged.connect(self.show_selection_details)
 
         side_tabs = QTabWidget()
-        self.zone_table = QTableWidget(0, 4)
+        self.zone_table = FilterableTableWidget(0, 4)
         self.zone_table.setHorizontalHeaderLabels(["Zone", "Description", "Floor", "Devices"])
         side_tabs.addTab(self.zone_table, "Zones")
+
+        layers_page = QWidget()
+        layers_layout = QVBoxLayout(layers_page)
+        layers_layout.setContentsMargins(6, 6, 6, 6)
+        layers_hint = QLabel(
+            "Toggle DXF geometry and text layers. Visibility is retained while "
+            "this project is open."
+        )
+        layers_hint.setWordWrap(True)
+        layers_layout.addWidget(layers_hint)
+        self.layer_list = QListWidget()
+        self.layer_list.itemChanged.connect(self.layer_visibility_changed)
+        layers_layout.addWidget(self.layer_list, 1)
+        side_tabs.addTab(layers_page, "DXF layers")
 
         placement = QWidget()
         placement_layout = QVBoxLayout(placement)
@@ -522,6 +1310,11 @@ class ZonesMapPage(Page):
         self.layout.addWidget(splitter, 1)
         self.pending_shapes: dict[int, list[DxfShape]] = {}
         self.shape_items: dict[QGraphicsPolygonItem, DxfShape] = {}
+        self.geometry_items: dict[QGraphicsPolygonItem, dict] = {}
+        self.layer_visibility: dict[int, dict[str, bool]] = {}
+        self.drawing_points: list[QPointF] = []
+        self.drawing_preview = None
+        self.drawing_markers: list[QGraphicsItem] = []
         self.asset_rows: list[dict] = []
         self.asset_by_key: dict[tuple[str, str], dict] = {}
 
@@ -529,22 +1322,116 @@ class ZonesMapPage(Page):
         self.floor_combo.blockSignals(True)
         self.floor_combo.clear()
         self.zone_combo.clear()
+        self.zone_table.setSortingEnabled(False)
         self.zone_table.setRowCount(0)
         if self.repository:
+            assigned_zones = {
+                int(row["zone"])
+                for row in self.repository.fetch_zone_geometry()
+            }
             for floor in self.repository.fetch_floors():
                 self.floor_combo.addItem(floor["name"], floor["id"])
             for zone in self.repository.fetch_zones():
-                self.zone_combo.addItem(_zone_label(zone), zone["number"])
+                if int(zone["number"]) not in assigned_zones:
+                    self.zone_combo.addItem(
+                        _zone_label(zone),
+                        zone["number"],
+                    )
                 row = self.zone_table.rowCount()
                 self.zone_table.insertRow(row)
                 for column, value in enumerate(
                     [zone["number"], zone["description"], zone["floor_name"], zone["device_count"]]
                 ):
                     self.zone_table.setItem(row, column, _item(value))
+        self.zone_table.setSortingEnabled(True)
+        self.zone_table.apply_filters()
         self.floor_combo.blockSignals(False)
         self._build_asset_rows()
         self.refresh_asset_list()
+        self.floor_changed()
+
+    def _available_zone_choices(
+        self,
+        include_zone: object | None = None,
+    ) -> list[tuple[str, object]]:
+        if not self.repository:
+            return []
+        included = (
+            int(include_zone)
+            if include_zone is not None
+            else None
+        )
+        assigned = {
+            int(row["zone"])
+            for row in self.repository.fetch_zone_geometry()
+            if included is None or int(row["zone"]) != included
+        }
+        return [
+            (_zone_label(row), row["number"])
+            for row in self.repository.fetch_zones()
+            if int(row["number"]) not in assigned
+        ]
+
+    def _refresh_preserving_view(self) -> None:
+        floor_id = self.floor_combo.currentData()
+        transform = self.view.transform()
+        centre = self.view.mapToScene(
+            self.view.viewport().rect().center()
+        )
+        self.refresh()
+        if floor_id is not None:
+            index = self.floor_combo.findData(floor_id)
+            if index >= 0 and index != self.floor_combo.currentIndex():
+                self.floor_combo.blockSignals(True)
+                self.floor_combo.setCurrentIndex(index)
+                self.floor_combo.blockSignals(False)
+                self._refresh_layer_list()
+                self.refresh_scene(False)
+        self.view.setTransform(transform)
+        self.view.centerOn(centre)
+
+    def floor_changed(self) -> None:
+        self._refresh_layer_list()
         self.refresh_scene()
+
+    def _refresh_layer_list(self) -> None:
+        self.layer_list.blockSignals(True)
+        self.layer_list.clear()
+        floor_id = self.floor_combo.currentData()
+        if not self.repository or floor_id is None:
+            self.layer_list.blockSignals(False)
+            return
+        floor = next(
+            (
+                row
+                for row in self.repository.fetch_floors()
+                if row["id"] == floor_id
+            ),
+            None,
+        )
+        if floor and floor["dxf_path"] and Path(floor["dxf_path"]).exists():
+            visibility = self.layer_visibility.setdefault(int(floor_id), {})
+            for layer in read_layers(floor["dxf_path"]):
+                item = QListWidgetItem(layer)
+                item.setData(Qt.ItemDataRole.UserRole, layer)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if visibility.get(layer, True)
+                    else Qt.CheckState.Unchecked
+                )
+                self.layer_list.addItem(item)
+        self.layer_list.blockSignals(False)
+
+    def layer_visibility_changed(self, item: QListWidgetItem) -> None:
+        floor_id = self.floor_combo.currentData()
+        if floor_id is None:
+            return
+        layer = str(item.data(Qt.ItemDataRole.UserRole))
+        self.layer_visibility.setdefault(int(floor_id), {})[layer] = (
+            item.checkState() == Qt.CheckState.Checked
+        )
+        self.refresh_scene(False)
 
     def _build_asset_rows(self) -> None:
         self.asset_rows = []
@@ -638,9 +1525,121 @@ class ZonesMapPage(Page):
         except Exception as error:
             QMessageBox.critical(self, "DXF import failed", str(error))
 
-    def refresh_scene(self) -> None:
-        self.scene.clear()
+    def replace_dxf(self) -> None:
+        if not self.repository or self.floor_combo.currentData() is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select replacement floor drawing",
+            "",
+            "DXF drawings (*.dxf)",
+        )
+        if not path:
+            return
+        try:
+            shapes = read_closed_shapes(path)
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "DXF replacement failed",
+                f"The replacement drawing could not be read.\n\n{error}",
+            )
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Replace floor DXF",
+                "Replace the current DXF underlay? Existing assigned zone "
+                "polygons and placed devices will be retained.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        floor_id = int(self.floor_combo.currentData())
+        self.repository.set_floor_dxf(floor_id, path)
+        assigned_points = {
+            tuple(
+                (round(float(x), 5), round(float(y), 5))
+                for x, y in json.loads(row["geometry_json"])
+            )
+            for row in self.repository.fetch_zone_geometry()
+            if int(row["floor_id"]) == floor_id
+        }
+        self.pending_shapes[floor_id] = [
+            shape
+            for shape in shapes
+            if tuple(
+                (round(float(x), 5), round(float(y), 5))
+                for x, y in shape.points
+            )
+            not in assigned_points
+        ]
+        self.layer_visibility.pop(floor_id, None)
+        self.floor_changed()
+        QMessageBox.information(
+            self,
+            "DXF replaced",
+            f"The underlay was replaced and {len(shapes):,} enclosed "
+            "polylines were found.",
+        )
+
+    def remove_dxf(self) -> None:
+        if not self.repository or self.floor_combo.currentData() is None:
+            return
+        floor_id = int(self.floor_combo.currentData())
+        floor = next(
+            (
+                row
+                for row in self.repository.fetch_floors()
+                if int(row["id"]) == floor_id
+            ),
+            None,
+        )
+        if floor is None or not floor["dxf_path"]:
+            QMessageBox.information(
+                self,
+                "No DXF attached",
+                "The selected floor does not have a DXF underlay.",
+            )
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Remove floor DXF",
+                "Remove the DXF underlay from this floor? Existing assigned "
+                "zone polygons and placed devices will be retained.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self.repository.set_floor_dxf(floor_id, None)
+        self.pending_shapes.pop(floor_id, None)
+        self.layer_visibility.pop(floor_id, None)
+        self.floor_changed()
+        QMessageBox.information(
+            self,
+            "DXF removed",
+            "The DXF underlay was removed. Zone polygons and placed devices "
+            "were retained.",
+        )
+
+    def refresh_scene(self, fit: bool = True) -> None:
         self.shape_items.clear()
+        self.geometry_items.clear()
+        self.scene.blockSignals(True)
+        try:
+            self.scene.clear()
+        finally:
+            self.scene.blockSignals(False)
+        self.drawing_points.clear()
+        self.drawing_preview = None
+        self.drawing_markers.clear()
         if not self.repository:
             return
         floor_id = self.floor_combo.currentData()
@@ -650,15 +1649,41 @@ class ZonesMapPage(Page):
             (row for row in self.repository.fetch_floors() if row["id"] == floor_id),
             None,
         )
+        visibility = self.layer_visibility.setdefault(int(floor_id), {})
         if floor and floor["dxf_path"] and Path(floor["dxf_path"]).exists():
             for entity in read_linework(floor["dxf_path"]):
+                if not visibility.get(entity.layer, True):
+                    continue
                 path = QPainterPath()
                 path.moveTo(entity.points[0][0], -entity.points[0][1])
                 for x, y in entity.points[1:]:
                     path.lineTo(x, -y)
-                item = self.scene.addPath(path, QPen(QColor("#94a3b8"), 0))
+                if entity.closed:
+                    path.closeSubpath()
+                brush = (
+                    QBrush(QColor("#64748b"))
+                    if entity.entity_type in {"SOLID", "TRACE", "3DFACE"}
+                    else QBrush(Qt.BrushStyle.NoBrush)
+                )
+                item = self.scene.addPath(
+                    path,
+                    QPen(QColor("#94a3b8"), 0),
+                    brush,
+                )
                 item.setZValue(-20)
                 item.setToolTip(f"DXF layer: {entity.layer}")
+                item.setData(20, entity.layer)
+            for text in read_text(floor["dxf_path"]):
+                if not visibility.get(text.layer, True):
+                    continue
+                item = self.scene.addSimpleText(text.text)
+                item.setBrush(QBrush(QColor("#52657a")))
+                item.setPos(text.x, -text.y)
+                item.setRotation(-text.rotation)
+                item.setScale(max(text.height / 12.0, 0.05))
+                item.setZValue(1000)
+                item.setToolTip(f"DXF text layer: {text.layer}")
+                item.setData(20, text.layer)
         assigned = [
             row for row in self.repository.fetch_zone_geometry() if row["floor_id"] == floor_id
         ]
@@ -691,7 +1716,15 @@ class ZonesMapPage(Page):
                 None,
             )
             item.setZValue(-10)
+            item.setData(30, int(row["id"]))
+            item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+                self.view.edit_geometry_mode,
+            )
+            self.geometry_items[item] = dict(row)
         for shape in self.pending_shapes.get(floor_id, []):
+            if not visibility.get(shape.layer, True):
+                continue
             item = self._add_polygon(shape.points, QColor("#dbe3ec"), shape.layer, shape)
             self.shape_items[item] = shape
         for placement in self.repository.fetch_map_assets(int(floor_id)):
@@ -704,7 +1737,7 @@ class ZonesMapPage(Page):
                     float(placement["x"]),
                     float(placement["y"]),
                 )
-        if self.scene.itemsBoundingRect().isValid():
+        if fit and self.scene.itemsBoundingRect().isValid():
             self.view.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def _add_polygon(
@@ -716,9 +1749,11 @@ class ZonesMapPage(Page):
     ) -> QGraphicsPolygonItem:
         polygon = QPolygonF([QPointF(x, -y) for x, y in points])
         item = self.scene.addPolygon(polygon, QPen(QColor("#42566f"), 0), QBrush(colour))
+        item.setFillRule(Qt.FillRule.WindingFill)
         item.setOpacity(0.72)
         item.setToolTip(tooltip)
         item.setFlag(QGraphicsPolygonItem.GraphicsItemFlag.ItemIsSelectable, True)
+        item.setData(40, colour.name())
         if shape is not None:
             item.setData(0, shape.layer)
         return item
@@ -795,6 +1830,9 @@ class ZonesMapPage(Page):
             self.asset_details.setText(self._asset_detail_text(payload))
 
     def place_selected(self, point: QPointF) -> None:
+        if self.view.draw_mode:
+            self._add_draw_point(point)
+            return
         if not self.repository or self.floor_combo.currentData() is None:
             return
         item = self.asset_list.currentItem()
@@ -815,7 +1853,166 @@ class ZonesMapPage(Page):
         self.refresh_asset_list()
         self.refresh_scene()
 
+    def set_draw_mode(self, enabled: bool) -> None:
+        self.view.draw_mode = bool(enabled)
+        self.finish_polygon_button.setEnabled(bool(enabled))
+        self.undo_polygon_button.setEnabled(bool(enabled))
+        self.cancel_polygon_button.setEnabled(bool(enabled))
+        if enabled:
+            self.move_polygon_button.setChecked(False)
+            self.cancel_drawing(leave_mode=True)
+            self.view.setCursor(Qt.CursorShape.CrossCursor)
+            self.view.setFocus()
+        else:
+            self.view.unsetCursor()
+            self.cancel_drawing(leave_mode=True)
+
+    def set_move_mode(self, enabled: bool) -> None:
+        self.view.edit_geometry_mode = bool(enabled)
+        if enabled:
+            self.draw_polygon_button.setChecked(False)
+        for item in self.geometry_items:
+            item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+                bool(enabled),
+            )
+
+    def _add_draw_point(self, point: QPointF) -> None:
+        if self.drawing_points and (
+            point - self.drawing_points[-1]
+        ).manhattanLength() < 0.001:
+            return
+        self.drawing_points.append(point)
+        self._update_drawing_preview()
+
+    def _update_drawing_preview(self) -> None:
+        if self.drawing_preview is not None:
+            self.scene.removeItem(self.drawing_preview)
+            self.drawing_preview = None
+        for marker in self.drawing_markers:
+            if marker.scene() is self.scene:
+                self.scene.removeItem(marker)
+        self.drawing_markers.clear()
+        if not self.drawing_points:
+            return
+        path = QPainterPath(self.drawing_points[0])
+        for point in self.drawing_points[1:]:
+            path.lineTo(point)
+        self.drawing_preview = self.scene.addPath(
+            path,
+            QPen(QColor("#dc3545"), 0),
+        )
+        self.drawing_preview.setZValue(50)
+        for point in self.drawing_points:
+            marker = self.scene.addEllipse(
+                -4,
+                -4,
+                8,
+                8,
+                QPen(QColor("#ffffff"), 1),
+                QBrush(QColor("#dc3545")),
+            )
+            marker.setPos(point)
+            marker.setZValue(51)
+            marker.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                True,
+            )
+            self.drawing_markers.append(marker)
+
+    def undo_draw_point(self) -> None:
+        if not self.view.draw_mode or not self.drawing_points:
+            return
+        self.drawing_points.pop()
+        self._update_drawing_preview()
+
+    def cancel_drawing(self, leave_mode: bool = False) -> None:
+        self.drawing_points.clear()
+        self._update_drawing_preview()
+        if not leave_mode and self.draw_polygon_button.isChecked():
+            self.draw_polygon_button.setChecked(False)
+
+    def finish_drawn_polygon(self, point: QPointF | None = None) -> None:
+        if not self.view.draw_mode:
+            return
+        if point is not None:
+            self._add_draw_point(point)
+        if len(self.drawing_points) < 3:
+            QMessageBox.information(
+                self,
+                "More points required",
+                "A zone polygon needs at least three points. Click each corner, "
+                "then use Finish polygon, right-click, double-click or Enter.",
+            )
+            return
+        if (
+            not self.repository
+            or self.floor_combo.currentData() is None
+            or self.zone_combo.currentData() is None
+        ):
+            return
+        points = [(value.x(), -value.y()) for value in self.drawing_points]
+        points.append(points[0])
+        zone = int(self.zone_combo.currentData())
+        floor_id = int(self.floor_combo.currentData())
+        if not self._confirm_geometry_replacement(zone, floor_id):
+            return
+        try:
+            self.repository.assign_zone_geometry(
+                zone,
+                floor_id,
+                points,
+                "USER_DRAWN",
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Could not save polygon", str(error))
+            return
+        self.draw_polygon_button.setChecked(False)
+        self._refresh_preserving_view()
+        self.geometry_changed.emit()
+
+    def geometry_item_moved(self, item: QGraphicsItem) -> None:
+        row = self.geometry_items.get(item)
+        if not self.repository or row is None:
+            return
+        offset = item.pos()
+        if abs(offset.x()) < 1e-9 and abs(offset.y()) < 1e-9:
+            return
+        points = [
+            (float(x) + offset.x(), float(y) - offset.y())
+            for x, y in json.loads(row["geometry_json"])
+        ]
+        self.repository.update_zone_geometry(int(row["id"]), points)
+        item.setPos(0, 0)
+        self.refresh_scene(False)
+        self.geometry_changed.emit()
+
     def show_selection_details(self) -> None:
+        try:
+            selected_items = set(self.scene.selectedItems())
+        except RuntimeError:
+            return
+        for polygon in list(
+            set(self.shape_items) | set(self.geometry_items)
+        ):
+            try:
+                if polygon in selected_items:
+                    polygon.setBrush(QBrush(QColor("#4da3ff")))
+                    polygon.setPen(QPen(QColor("#0b5ed7"), 0))
+                    polygon.setOpacity(0.9)
+                else:
+                    polygon.setBrush(
+                        QBrush(
+                            QColor(
+                                str(polygon.data(40) or "#dbe3ec")
+                            )
+                        )
+                    )
+                    polygon.setPen(QPen(QColor("#42566f"), 0))
+                    polygon.setOpacity(0.72)
+            except RuntimeError:
+                self.shape_items.pop(polygon, None)
+                self.geometry_items.pop(polygon, None)
         for item in self.scene.selectedItems():
             key = item.data(10)
             if key:
@@ -880,19 +2077,309 @@ class ZonesMapPage(Page):
             QMessageBox.information(self, "Select a shape", "Select an unassigned grey polyline first.")
             return
         item = selected[0]
+        self._assign_shape(self.shape_items[item], int(self.zone_combo.currentData()))
+
+    def assign_shape_from_context(
+        self,
+        item: QGraphicsItem | None,
+        scene_point: QPointF,
+    ) -> None:
+        candidates = self._polygons_at(scene_point)
+        if len(candidates) > 1:
+            item = self._choose_overlapping_polygon(candidates)
+            if item is None:
+                return
+        elif len(candidates) == 1:
+            item = candidates[0]
+        if item in self.geometry_items:
+            self._show_assigned_geometry_menu(item)
+            return
+        if (
+            not self.repository
+            or self.floor_combo.currentData() is None
+            or item not in self.shape_items
+        ):
+            return
         shape = self.shape_items[item]
+        if (
+            QMessageBox.question(
+                self,
+                "Assign enclosed polyline",
+                "Do you want to assign a zone to this enclosed DXF polyline?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        zones = self._available_zone_choices()
+        if not zones:
+            QMessageBox.information(
+                self,
+                "No zones available",
+                "Import a configuration containing zones before assigning shapes.",
+            )
+            return
+        dialog = ZoneSelectionDialog(
+            zones,
+            self.zone_combo.currentData(),
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_zone = dialog.selected_zone()
+        selected_index = self.zone_combo.findData(selected_zone)
+        self.zone_combo.setCurrentIndex(selected_index)
+        self._assign_shape(
+            shape,
+            int(selected_zone),
+        )
+
+    def select_polygon_at_point(self, scene_point: QPointF) -> None:
+        candidates = self._polygons_at(scene_point)
+        if not candidates:
+            return
+        polygon = (
+            self._choose_overlapping_polygon(candidates)
+            if len(candidates) > 1
+            else candidates[0]
+        )
+        if polygon is None:
+            return
+        self.scene.clearSelection()
+        polygon.setSelected(True)
+
+    def _polygons_at(
+        self,
+        scene_point: QPointF,
+    ) -> list[QGraphicsPolygonItem]:
+        return [
+            item
+            for item in self.scene.items(scene_point)
+            if item in self.shape_items or item in self.geometry_items
+        ]
+
+    def _choose_overlapping_polygon(
+        self,
+        polygons: list[QGraphicsPolygonItem],
+    ) -> QGraphicsPolygonItem | None:
+        choices: list[tuple[str, QGraphicsPolygonItem]] = []
+        for index, polygon in enumerate(polygons, start=1):
+            if polygon in self.geometry_items:
+                row = self.geometry_items[polygon]
+                description = str(row.get("description") or "").strip()
+                label = (
+                    f"Assigned: Zone {row['zone']}"
+                    f"{' - ' + description if description else ''}"
+                )
+            else:
+                shape = self.shape_items[polygon]
+                label = (
+                    f"Unassigned: {shape.layer} "
+                    f"({shape.entity_type}, polygon {index})"
+                )
+            choices.append((label, polygon))
+        dialog = PolygonSelectionDialog(choices, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected_polygon()
+
+    def _show_assigned_geometry_menu(
+        self,
+        item: QGraphicsPolygonItem,
+    ) -> None:
+        menu = QMenu(self)
+        reassign = menu.addAction("Reassign to another zone…")
+        rotate_left = menu.addAction("Rotate 90° left")
+        rotate_right = menu.addAction("Rotate 90° right")
+        align = menu.addAction("Realign nearest edge")
+        menu.addSeparator()
+        unassign = menu.addAction("Unassign polygon")
+        action = menu.exec(QCursor.pos())
+        if action == reassign:
+            self.reassign_geometry(item)
+        elif action == rotate_left:
+            self.rotate_geometry(item, -90.0)
+        elif action == rotate_right:
+            self.rotate_geometry(item, 90.0)
+        elif action == align:
+            self.realign_geometry(item)
+        elif action == unassign:
+            self.unassign_geometry(item)
+
+    def reassign_geometry(self, item: QGraphicsPolygonItem) -> None:
+        row = self.geometry_items.get(item)
+        if not self.repository or row is None:
+            return
+        zones = self._available_zone_choices(row["zone"])
+        dialog = ZoneSelectionDialog(
+            zones,
+            row["zone"],
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_zone = dialog.selected_zone()
+        try:
+            self.repository.reassign_zone_geometry(
+                int(row["id"]),
+                int(selected_zone),
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Could not reassign polygon", str(error))
+            return
+        self._refresh_preserving_view()
+        self.geometry_changed.emit()
+
+    def unassign_geometry(self, item: QGraphicsPolygonItem) -> None:
+        row = self.geometry_items.get(item)
+        if not self.repository or row is None:
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Unassign zone polygon",
+                f"Remove this polygon from zone {row['zone']}?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        floor_id = int(row["floor_id"])
+        points = [
+            (float(x), float(y))
+            for x, y in json.loads(row["geometry_json"])
+        ]
+        self.repository.remove_zone_geometry(int(row["id"]))
+        self.pending_shapes.setdefault(floor_id, []).append(
+            DxfShape(
+                layer=str(row["source_layer"] or "USER_DRAWN"),
+                entity_type="LWPOLYLINE",
+                points=points,
+            )
+        )
+        self._refresh_preserving_view()
+        self.geometry_changed.emit()
+
+    def rotate_geometry(
+        self,
+        item: QGraphicsPolygonItem,
+        degrees: float,
+    ) -> None:
+        row = self.geometry_items.get(item)
+        if not self.repository or row is None:
+            return
+        points = [
+            (float(x), float(y))
+            for x, y in json.loads(row["geometry_json"])
+        ]
+        rotated = self._rotated_points(points, degrees)
+        self.repository.update_zone_geometry(int(row["id"]), rotated)
+        self.refresh_scene(False)
+        self.geometry_changed.emit()
+
+    def realign_geometry(self, item: QGraphicsPolygonItem) -> None:
+        row = self.geometry_items.get(item)
+        if row is None:
+            return
+        points = [
+            (float(x), float(y))
+            for x, y in json.loads(row["geometry_json"])
+        ]
+        unique = points[:-1] if len(points) > 1 and points[0] == points[-1] else points
+        if len(unique) < 2:
+            return
+        longest = max(
+            zip(unique, unique[1:] + unique[:1]),
+            key=lambda pair: (
+                (pair[1][0] - pair[0][0]) ** 2
+                + (pair[1][1] - pair[0][1]) ** 2
+            ),
+        )
+        angle = math.degrees(
+            math.atan2(
+                longest[1][1] - longest[0][1],
+                longest[1][0] - longest[0][0],
+            )
+        )
+        target = round(angle / 90.0) * 90.0
+        self.rotate_geometry(item, target - angle)
+
+    @staticmethod
+    def _rotated_points(
+        points: list[tuple[float, float]],
+        degrees: float,
+    ) -> list[tuple[float, float]]:
+        closed = len(points) > 1 and points[0] == points[-1]
+        unique = points[:-1] if closed else points
+        if not unique:
+            return points
+        centre_x = sum(point[0] for point in unique) / len(unique)
+        centre_y = sum(point[1] for point in unique) / len(unique)
+        radians = math.radians(degrees)
+        cosine = math.cos(radians)
+        sine = math.sin(radians)
+        rotated = [
+            (
+                centre_x
+                + (x - centre_x) * cosine
+                - (y - centre_y) * sine,
+                centre_y
+                + (x - centre_x) * sine
+                + (y - centre_y) * cosine,
+            )
+            for x, y in unique
+        ]
+        if closed:
+            rotated.append(rotated[0])
+        return rotated
+
+    def _assign_shape(self, shape: DxfShape, zone: int) -> None:
+        if not self.repository or self.floor_combo.currentData() is None:
+            return
+        floor_id = int(self.floor_combo.currentData())
+        if not self._confirm_geometry_replacement(int(zone), floor_id):
+            return
         self.repository.assign_zone_geometry(
-            int(self.zone_combo.currentData()),
-            int(self.floor_combo.currentData()),
+            int(zone),
+            floor_id,
             shape.points,
             shape.layer,
         )
-        self.pending_shapes[int(self.floor_combo.currentData())].remove(shape)
-        self.refresh()
+        if shape in self.pending_shapes.get(floor_id, []):
+            self.pending_shapes[floor_id].remove(shape)
+        self._refresh_preserving_view()
         self.geometry_changed.emit()
+
+    def _confirm_geometry_replacement(self, zone: int, floor_id: int) -> bool:
+        if not self.repository:
+            return False
+        existing = any(
+            int(row["zone"]) == int(zone)
+            and int(row["floor_id"]) == int(floor_id)
+            for row in self.repository.fetch_zone_geometry()
+        )
+        if not existing:
+            return True
+        return (
+            QMessageBox.question(
+                self,
+                "Replace zone polygon",
+                f"Zone {zone} already has a polygon on this floor. Replace it?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            == QMessageBox.StandardButton.Yes
+        )
 
 
 class MatrixPage(Page):
+    matrix_imported = Signal()
+
     def __init__(self):
         super().__init__("Cause and effect matrix")
         note = QLabel(
@@ -902,25 +2389,176 @@ class MatrixPage(Page):
         note.setWordWrap(True)
         self.layout.addWidget(note)
         controls = QHBoxLayout()
+        import_matrix = QPushButton("Import Cause & Effect workbook")
+        import_matrix.clicked.connect(self.import_workbook)
         generate = QPushButton("Generate HTM adjacency suggestions")
+        generate.setProperty("secondary", True)
         generate.clicked.connect(self.generate)
         custom = QPushButton("Add custom door / output rule")
         custom.setProperty("secondary", True)
         custom.clicked.connect(self.add_custom)
+        controls.addWidget(import_matrix)
         controls.addWidget(generate)
         controls.addWidget(custom)
         controls.addStretch()
         self.layout.addLayout(controls)
-        self.table = QTableWidget(0, 8)
+
+        self.validation = QLabel("No Cause & Effect workbook has been imported.")
+        self.validation.setWordWrap(True)
+        self.layout.addWidget(self.validation)
+
+        self.tabs = QTabWidget()
+        self.activation_table = FilterableTableWidget(0, 9)
+        self.activation_table.setHorizontalHeaderLabels(
+            [
+                "Node Number",
+                "Node Name",
+                "Output Group Number",
+                "Output Group Name",
+                "Zone Number",
+                "Zone Name",
+                "Ringing Style",
+                "Reference Check",
+                "Comments",
+            ]
+        )
+        self.activation_table.setAlternatingRowColors(True)
+        self.activation_table.setSortingEnabled(True)
+        self.activation_table.setColumnWidth(1, 240)
+        self.activation_table.setColumnWidth(3, 300)
+        self.activation_table.setColumnWidth(5, 260)
+        self.activation_table.setColumnWidth(8, 320)
+        self.activation_table.itemChanged.connect(self._activation_changed)
+        self.tabs.addTab(self.activation_table, "Imported activations")
+
+        self.activation_matrix = CauseEffectMatrixWidget()
+        self.tabs.addTab(self.activation_matrix, "Activation matrix")
+
+        self.reference_table = FilterableTableWidget(0, 8)
+        self.reference_table.setHorizontalHeaderLabels(
+            [
+                "Node Number",
+                "Node Name",
+                "Output Group Number",
+                "Output Group Name",
+                "Zone Number",
+                "Zone Name",
+                "Ringing Style",
+                "Issue",
+            ]
+        )
+        self.reference_table.setAlternatingRowColors(True)
+        self.reference_table.setSortingEnabled(True)
+        self.reference_table.setColumnWidth(1, 240)
+        self.reference_table.setColumnWidth(3, 300)
+        self.reference_table.setColumnWidth(5, 260)
+        self.tabs.addTab(self.reference_table, "OutputGroupInfo-only")
+
+        self.table = FilterableTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             ["Trigger", "Relation", "Target zone", "Target node", "Output group", "Action", "Source", "Notes"]
         )
         self.table.setAlternatingRowColors(True)
         self.table.setColumnWidth(5, 180)
         self.table.setColumnWidth(7, 360)
-        self.layout.addWidget(self.table, 1)
+        self.tabs.addTab(self.table, "Editable rules")
+        self.layout.addWidget(self.tabs, 1)
 
     def refresh(self) -> None:
+        self.refresh_activations()
+        self.refresh_rules()
+
+    def refresh_activations(self) -> None:
+        self.activation_table.blockSignals(True)
+        self.activation_table.setSortingEnabled(False)
+        self.activation_table.setRowCount(0)
+        self.activation_matrix.set_activations([])
+        self.reference_table.setSortingEnabled(False)
+        self.reference_table.setRowCount(0)
+        if not self.repository:
+            self.validation.setText("No Cause & Effect workbook has been imported.")
+            self.activation_table.setSortingEnabled(True)
+            self.reference_table.setSortingEnabled(True)
+            self.activation_table.blockSignals(False)
+            return
+
+        imported = self.repository.latest_cause_effect_import()
+        if imported is None:
+            self.validation.setText("No Cause & Effect workbook has been imported.")
+            self.activation_table.setSortingEnabled(True)
+            self.reference_table.setSortingEnabled(True)
+            self.activation_table.blockSignals(False)
+            return
+
+        issue_count = imported["matrix_only_count"] + imported["reference_only_count"]
+        self.validation.setText(
+            f"{imported['source_name']}: {imported['activation_count']:,} matrix "
+            f"activations; {imported['matched_count']:,} matched OutputGroupInfo; "
+            f"{imported['matrix_only_count']:,} matrix-only; "
+            f"{imported['reference_only_count']:,} reference-only."
+        )
+        self.validation.setStyleSheet(
+            "color: #b45309;" if issue_count else "color: #166534;"
+        )
+        activations = self.repository.fetch_cause_effect_activations()
+        for activation in activations:
+            row = self.activation_table.rowCount()
+            self.activation_table.insertRow(row)
+            values = [
+                activation["target_node"],
+                activation["target_node_name"],
+                activation["output_group"],
+                activation["output_group_name"],
+                activation["trigger_zone"],
+                activation["output_zone_name"],
+                activation["ringing_style"],
+                (
+                    "Matched"
+                    if activation["reference_status"] == "matched"
+                    else "Matrix only"
+                ),
+                activation["comments"],
+            ]
+            for column, value in enumerate(values):
+                item = _item(value)
+                if column != 8:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setData(Qt.ItemDataRole.UserRole, activation["id"])
+                if column == 7 and activation["reference_status"] != "matched":
+                    item.setBackground(QColor("#fff3cd"))
+                self.activation_table.setItem(row, column, item)
+        self.activation_matrix.set_activations(
+            activations,
+            self.repository.fetch_cause_effect_output_groups(),
+        )
+        for reference in self.repository.fetch_cause_effect_reference_only():
+            row = self.reference_table.rowCount()
+            self.reference_table.insertRow(row)
+            values = [
+                reference["target_node"],
+                reference["target_node_name"],
+                reference["output_group"],
+                reference["output_group_name"],
+                reference["trigger_zone"],
+                reference["output_zone_name"],
+                reference["ringing_style"],
+                "Not present in Cause & Effect matrix",
+            ]
+            for column, value in enumerate(values):
+                item = _item(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column == 7:
+                    item.setBackground(QColor("#f8d7da"))
+                self.reference_table.setItem(row, column, item)
+        self.activation_table.setSortingEnabled(True)
+        self.activation_table.apply_filters()
+        self.reference_table.setSortingEnabled(True)
+        self.reference_table.apply_filters()
+        self.activation_table.blockSignals(False)
+
+    def refresh_rules(self) -> None:
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         if not self.repository:
             return
@@ -933,6 +2571,50 @@ class MatrixPage(Page):
             ]
             for column, value in enumerate(values):
                 self.table.setItem(row, column, _item(value))
+        self.table.setSortingEnabled(True)
+        self.table.apply_filters()
+
+    def import_workbook(self) -> None:
+        if not self.repository:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Cause & Effect workbook",
+            "",
+            "Excel workbooks (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            _, parsed = self.repository.import_cause_effect(path)
+            self.refresh()
+            self.matrix_imported.emit()
+            self.tabs.setCurrentIndex(0)
+            summary = (
+                f"Imported {len(parsed.activations):,} matrix activations.\n"
+                f"{parsed.matched_count:,} matched OutputGroupInfo; "
+                f"{parsed.matrix_only_count:,} matrix-only; "
+                f"{parsed.reference_only_count:,} reference-only."
+            )
+            if parsed.warnings:
+                summary += "\n\n" + "\n".join(parsed.warnings)
+            QMessageBox.information(self, "Cause & Effect imported", summary)
+        except Exception as error:
+            QMessageBox.critical(self, "Cause & Effect import failed", str(error))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _activation_changed(self, item: QTableWidgetItem) -> None:
+        if not self.repository or item.column() != 8:
+            return
+        activation_id = item.data(Qt.ItemDataRole.UserRole)
+        if activation_id is not None:
+            self.repository.update_cause_effect_comment(
+                int(activation_id),
+                item.text(),
+            )
+            self.activation_table.apply_filters()
 
     def generate(self) -> None:
         if not self.repository:
@@ -1004,6 +2686,102 @@ class RuleDialog(QDialog):
         self.accept()
 
 
+class ZoneTestExportDialog(QDialog):
+    def __init__(self, repository: ProjectRepository, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Select zones for spreadsheet testing")
+        self.resize(620, 540)
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "Select the fire-call trigger zones to include. Every expected "
+                "output-group activation for each selected zone will be listed."
+            )
+        )
+        self.zone_search = QLineEdit()
+        self.zone_search.setPlaceholderText("Type a zone number or name…")
+        self.zone_search.setClearButtonEnabled(True)
+        self.zone_search.textChanged.connect(self._filter_zones)
+        layout.addWidget(self.zone_search)
+        controls = QHBoxLayout()
+        select_all = QPushButton("Select all zones")
+        select_all.clicked.connect(self._select_all)
+        clear = QPushButton("Clear selection")
+        clear.setProperty("secondary", True)
+        clear.clicked.connect(self._clear_selection)
+        controls.addWidget(select_all)
+        controls.addWidget(clear)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.zones = QListWidget()
+        self.zones.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        zone_names = {
+            normalise_zone_key(row["number"]): str(
+                row["description"] or ""
+            ).strip()
+            for row in repository.fetch_zones()
+        }
+        for row in repository.fetch_cause_effect_trigger_zones():
+            zone = normalise_zone_key(row["trigger_zone"])
+            name = str(row["trigger_zone_name"] or "").strip()
+            name = name or zone_names.get(zone, "")
+            item = QListWidgetItem(
+                f"Zone {zone}{' - ' + name if name else ''}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, zone)
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+            )
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.zones.addItem(item)
+        layout.addWidget(self.zones, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(
+            "Export workbook"
+        )
+        buttons.accepted.connect(self._accept_selection)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_zones(self) -> list[str]:
+        return [
+            str(self.zones.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.zones.count())
+            if self.zones.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _select_all(self) -> None:
+        for index in range(self.zones.count()):
+            self.zones.item(index).setCheckState(Qt.CheckState.Checked)
+
+    def _clear_selection(self) -> None:
+        for index in range(self.zones.count()):
+            self.zones.item(index).setCheckState(Qt.CheckState.Unchecked)
+
+    def _filter_zones(self, text: str) -> None:
+        query = text.strip().casefold()
+        for index in range(self.zones.count()):
+            item = self.zones.item(index)
+            item.setHidden(query not in item.text().casefold())
+
+    def _accept_selection(self) -> None:
+        if not self.selected_zones():
+            QMessageBox.information(
+                self,
+                "Select zones",
+                "Select at least one zone, or choose Select all zones.",
+            )
+            return
+        self.accept()
+
+
 class TestPage(Page):
     def __init__(self):
         super().__init__("Test mode")
@@ -1015,6 +2793,9 @@ class TestPage(Page):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.zone_combo.view().setMinimumWidth(680)
+        self.zone_combo.currentIndexChanged.connect(
+            self._selected_zone_changed
+        )
         self.scope_combo = QComboBox()
         self.engineer = QLineEdit()
         self.engineer.setPlaceholderText("Engineer")
@@ -1035,9 +2816,11 @@ class TestPage(Page):
         self.layout.addLayout(controls)
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.scene = QGraphicsScene()
-        self.map = QGraphicsView(self.scene)
+        self.map = MapGraphicsView(self.scene)
         self.map.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.results = QTableWidget(0, 9)
+        self.map.scene_clicked.connect(self.show_zone_popup_at)
+        self.zone_popup = None
+        self.results = FilterableTableWidget(0, 9)
         self.results.setHorizontalHeaderLabels(
             [
                 "Expected", "Zone", "Node", "Loop", "Address", "Sub",
@@ -1051,7 +2834,11 @@ class TestPage(Page):
         splitter.addWidget(self.map)
         splitter.addWidget(self.results)
         self.layout.addWidget(splitter, 1)
-        self.legend = QLabel("Green = normal  •  Red = fire/evacuate  •  Yellow = adjacent/pre-alarm alert")
+        self.legend = QLabel(
+            "Green = normal  •  Red = fire/evacuate  •  "
+            "Yellow = adjacent/pre-alarm alert  •  "
+            "Wheel = zoom  •  Left or middle drag = pan"
+        )
         self.layout.addWidget(self.legend)
 
     def refresh(self) -> None:
@@ -1059,23 +2846,73 @@ class TestPage(Page):
         self.scope_combo.clear()
         self.scope_combo.addItem("Whole site / interpanel", None)
         if self.repository:
+            seen_zones: set[str] = set()
             for zone in self.repository.fetch_zones():
                 self.zone_combo.addItem(_zone_label(zone), zone["number"])
+                seen_zones.add(normalise_zone_key(zone["number"]))
+            for zone in self.repository.fetch_cause_effect_trigger_zones():
+                zone_key = normalise_zone_key(zone["trigger_zone"])
+                if zone_key in seen_zones:
+                    continue
+                description = str(zone["trigger_zone_name"] or "").strip()
+                label = (
+                    f"Zone {zone_key} - {description}"
+                    if description
+                    else f"Zone {zone_key}"
+                )
+                self.zone_combo.addItem(label, zone_key)
+                seen_zones.add(zone_key)
             for panel in self.repository.fetch_panels():
                 self.scope_combo.addItem(f"Node {panel['node']} — {panel['name']}", panel["node"])
-        self._draw_map({})
+        self._selected_zone_changed()
+
+    def _selected_zone_changed(self) -> None:
+        if not self.repository or self.zone_combo.currentData() is None:
+            self._draw_map({}, set())
+            return
+        zone = normalise_zone_key(self.zone_combo.currentData())
+        visible = {int(zone)} if zone.isdigit() else set()
+        self._draw_map({}, visible)
 
     def simulate(self) -> None:
         if not self.repository or self.zone_combo.currentData() is None:
             return
-        trigger_zone = int(self.zone_combo.currentData())
+        trigger_zone = normalise_zone_key(self.zone_combo.currentData())
         scope_node = self.scope_combo.currentData()
-        effects = evaluate_zone(self.repository, trigger_zone)
+        effects = (
+            evaluate_zone(self.repository, int(trigger_zone))
+            if trigger_zone.isdigit()
+            else []
+        )
         effect_map = {effect.zone: effect.state for effect in effects}
-        self._draw_map(effect_map)
+        visible_zones = set(effect_map)
+        if trigger_zone.isdigit():
+            visible_zones.add(int(trigger_zone))
+        self._draw_map(effect_map, visible_zones)
+        self.results.setSortingEnabled(False)
         self.results.setRowCount(0)
         for effect in effects:
             self._append_result([effect.state, effect.zone, "", "", "", "", effect.reason], None)
+        for activation in self.repository.fetch_cause_effect_activations(
+            trigger_zone,
+            scope_node,
+        ):
+            self._append_result(
+                [
+                    activation["ringing_style"],
+                    activation["trigger_zone"],
+                    activation["target_node"],
+                    "",
+                    "",
+                    "",
+                    (
+                        f"Output group {activation['output_group']} - "
+                        f"{activation['output_group_name']}"
+                    ),
+                ],
+                f"activation/{activation['id']}",
+                activation["comments"],
+            )
         for device in self.repository.fetch_devices():
             if device["zone"] not in effect_map:
                 continue
@@ -1095,17 +2932,24 @@ class TestPage(Page):
                 ],
                 device["stable_key"],
             )
+        self.results.setSortingEnabled(True)
+        self.results.apply_filters()
 
-    def _append_result(self, values: list[object], stable_key: str | None) -> None:
+    def _append_result(
+        self,
+        values: list[object],
+        stable_key: str | None,
+        comments: str = "",
+    ) -> None:
         row = self.results.rowCount()
         self.results.insertRow(row)
-        for column, value in enumerate(values + ["", ""]):
+        for column, value in enumerate(values + ["", comments]):
             item = _item(value)
             if column == 0:
                 item.setData(Qt.ItemDataRole.UserRole, stable_key)
-                if str(value) == "EVACUATE":
+                if str(value) in {"EVACUATE", "E", "TE"}:
                     item.setBackground(QColor("#f8d7da"))
-                elif str(value) == "ALERT":
+                elif str(value) in {"ALERT", "A", "TA"}:
                     item.setBackground(QColor("#fff3cd"))
             self.results.setItem(row, column, item)
 
@@ -1126,7 +2970,7 @@ class TestPage(Page):
         session_id = self.repository.create_test_session(
             self.engineer.text().strip(),
             self.scope_combo.currentData(),
-            int(self.zone_combo.currentData()),
+            normalise_zone_key(self.zone_combo.currentData()),
             results,
         )
         QMessageBox.information(
@@ -1135,8 +2979,13 @@ class TestPage(Page):
             f"Commissioning test session {session_id} was saved with {len(results)} results/comments.",
         )
 
-    def _draw_map(self, effect_map: dict[int, str]) -> None:
+    def _draw_map(
+        self,
+        effect_map: dict[int, str],
+        visible_zones: set[int] | None = None,
+    ) -> None:
         self.scene.clear()
+        self.zone_popup = None
         if not self.repository:
             return
         device_rows = {
@@ -1146,6 +2995,11 @@ class TestPage(Page):
             str(row["node"]): dict(row) for row in self.repository.fetch_panels()
         }
         for row in self.repository.fetch_zone_geometry():
+            if (
+                visible_zones is not None
+                and int(row["zone"]) not in visible_zones
+            ):
+                continue
             state = effect_map.get(row["zone"], "NORMAL")
             colour = QColor("#6fca8c")
             if state == "EVACUATE":
@@ -1156,6 +3010,15 @@ class TestPage(Page):
             polygon = QPolygonF([QPointF(x, -y) for x, y in points])
             item = self.scene.addPolygon(polygon, QPen(QColor("#334155"), 0), QBrush(colour))
             item.setOpacity(0.75)
+            description = str(row["description"] or "").strip()
+            item.setData(
+                60,
+                {
+                    "zone": int(row["zone"]),
+                    "name": description,
+                    "status": state,
+                },
+            )
             item.setToolTip(f"Zone {row['zone']} — {state}")
         for placement in self.repository.fetch_map_assets():
             if placement["entity_kind"] == "device":
@@ -1201,11 +3064,52 @@ class TestPage(Page):
         if self.scene.itemsBoundingRect().isValid():
             self.map.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
+    def show_zone_popup_at(self, scene_point: QPointF) -> None:
+        zone_item = next(
+            (
+                item
+                for item in self.scene.items(scene_point)
+                if item.data(60) is not None
+            ),
+            None,
+        )
+        if zone_item is None:
+            return
+        if self.zone_popup is not None:
+            try:
+                self.scene.removeItem(self.zone_popup)
+            except RuntimeError:
+                pass
+            self.zone_popup = None
+        details = zone_item.data(60)
+        name = str(details["name"] or "Unnamed zone")
+        text = self.scene.addSimpleText(
+            f"Zone {details['zone']}\n{name}\nStatus: {details['status']}"
+        )
+        text.setBrush(QBrush(QColor("#172033")))
+        bounds = text.boundingRect()
+        popup = self.scene.addRect(
+            0,
+            0,
+            bounds.width() + 18,
+            bounds.height() + 14,
+            QPen(QColor("#183153"), 0),
+            QBrush(QColor("#ffffff")),
+        )
+        popup.setPos(
+            zone_item.sceneBoundingRect().topRight() + QPointF(12, 0)
+        )
+        popup.setZValue(2000)
+        text.setParentItem(popup)
+        text.setPos(9, 7)
+        text.setZValue(1)
+        self.zone_popup = popup
+
 
 class ChangesPage(Page):
     def __init__(self):
-        super().__init__("NCF tracked changes")
-        self.table = QTableWidget(0, 6)
+        super().__init__("Project tracked changes")
+        self.table = FilterableTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Type", "Entity", "Key", "Field", "Previous", "Current"])
         self.table.setAlternatingRowColors(True)
         self.table.setColumnWidth(4, 260)
@@ -1213,6 +3117,7 @@ class ChangesPage(Page):
         self.layout.addWidget(self.table, 1)
 
     def refresh(self) -> None:
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         if not self.repository:
             return
@@ -1230,6 +3135,8 @@ class ChangesPage(Page):
                     if change["change_type"] in colours:
                         item.setBackground(QColor(colours[change["change_type"]]))
                 self.table.setItem(row, column, item)
+        self.table.setSortingEnabled(True)
+        self.table.apply_filters()
 
 
 class MainWindow(QMainWindow):
@@ -1256,20 +3163,26 @@ class MainWindow(QMainWindow):
         self.navigation.setFixedWidth(225)
         self.navigation.addItems(
             [
-                "Overview", "Devices", "Nodes", "Output groups", "Zones & drawings",
-                "Cause & effect", "Test mode", "Tracked changes",
+                "Overview", "Devices", "Nodes", "Zones", "Output groups",
+                "Zone drawings", "Cause & effect", "Test mode", "Tracked changes",
             ]
         )
         self.pages = [
             DashboardPage(),
             DevicesPage(),
             NodesPage(),
+            ZonesPage(),
             OutputGroupsPage(),
             ZonesMapPage(),
             MatrixPage(),
             TestPage(),
             ChangesPage(),
         ]
+        matrix_page = next(
+            page for page in self.pages if isinstance(page, MatrixPage)
+        )
+        matrix_page.matrix_imported.connect(self.pages[0].refresh)
+        matrix_page.matrix_imported.connect(self.pages[-1].refresh)
         self.stack = QStackedWidget()
         for page in self.pages:
             self.stack.addWidget(page)
@@ -1298,8 +3211,8 @@ class MainWindow(QMainWindow):
             project_layout.addWidget(self._ribbon_button(text, icon, callback))
         project_layout.addSpacing(18)
         for text, icon, callback in (
-            ("Update NCF", "fa5s.arrows-rotate", self.update_ncf),
-            ("Import DXF", "fa5s.map", lambda: self._navigate(4)),
+            ("Update configuration", "fa5s.arrows-rotate", self.update_ncf),
+            ("Import DXF", "fa5s.map", lambda: self._navigate(5)),
             ("Export Excel", "fa5s.file-excel", self.export_excel),
             ("Changes PDF", "fa5s.file-pdf", self.export_pdf),
         ):
@@ -1310,11 +3223,12 @@ class MainWindow(QMainWindow):
         for text, icon, index in (
             ("Devices", "fa5s.microchip", 1),
             ("Nodes", "fa5s.network-wired", 2),
-            ("Output groups", "fa5s.volume-high", 3),
-            ("Map zones", "fa5s.draw-polygon", 4),
-            ("Matrix", "fa5s.table-cells", 5),
-            ("Test mode", "fa5s.fire", 6),
-            ("Changes", "fa5s.code-compare", 7),
+            ("Zones", "fa5s.layer-group", 3),
+            ("Output groups", "fa5s.volume-high", 4),
+            ("Map zones", "fa5s.draw-polygon", 5),
+            ("Matrix", "fa5s.table-cells", 6),
+            ("Test mode", "fa5s.fire", 7),
+            ("Changes", "fa5s.code-compare", 8),
         ):
             commission_layout.addWidget(self._ribbon_button(text, icon, lambda checked=False, i=index: self._navigate(i)))
         commission_layout.addStretch()
@@ -1354,6 +3268,32 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        export_menu = self.menuBar().addMenu("&Export")
+        export_menu.addSection("Commissioning data")
+        device_action = QAction("Device schedule (Excel)…", self)
+        device_action.triggered.connect(self.export_excel)
+        export_menu.addAction(device_action)
+
+        export_menu.addSection("Cause & Effect")
+        comparison_action = QAction("Comparison workbook…", self)
+        comparison_action.triggered.connect(
+            self.export_cause_effect_workbook
+        )
+        export_menu.addAction(comparison_action)
+
+        export_menu.addSection("Reports")
+        changes_action = QAction("Tracked changes (PDF)…", self)
+        changes_action.triggered.connect(self.export_pdf)
+        export_menu.addAction(changes_action)
+
+        export_menu.addSection("Testing")
+        test_export_action = QAction("Output-group test workbook…", self)
+        test_export_action.triggered.connect(self.export_testing_workbook)
+        export_menu.addAction(test_export_action)
+        test_import_action = QAction("Import completed test workbook…", self)
+        test_import_action.triggered.connect(self.import_testing_workbook)
+        export_menu.addAction(test_import_action)
+
     def _navigate(self, index: int) -> None:
         self.navigation.setCurrentRow(index)
 
@@ -1369,7 +3309,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No project open")
 
     def new_project(self) -> None:
-        ncf_path, _ = QFileDialog.getOpenFileName(self, "Select initial NCF", "", "Network configuration (*.ncf *.NCF)")
+        ncf_path, _ = QFileDialog.getOpenFileName(
+            self, "Select initial configuration", "", CONFIGURATION_FILTER
+        )
         if not ncf_path:
             return
         name, ok = QInputDialog.getText(self, "Project name", "Name", text=Path(ncf_path).stem)
@@ -1419,17 +3361,23 @@ class MainWindow(QMainWindow):
     def update_ncf(self) -> None:
         if not self.repository:
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Import updated NCF", "", "Network configuration (*.ncf *.NCF)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import updated configuration", "", CONFIGURATION_FILTER
+        )
         if not path:
             return
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            _, changes = self.repository.import_ncf(path)
+            _, changes = self.repository.import_configuration(path)
             self._set_repository(self.repository)
-            self._navigate(7)
-            QMessageBox.information(self, "NCF update complete", f"Recorded {len(changes)} changes.")
+            self._navigate(8)
+            QMessageBox.information(
+                self,
+                "Configuration update complete",
+                f"Recorded {len(changes)} changes.",
+            )
         except Exception as error:
-            QMessageBox.critical(self, "NCF update failed", str(error))
+            QMessageBox.critical(self, "Configuration update failed", str(error))
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -1444,10 +3392,91 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 QMessageBox.critical(self, "Export failed", str(error))
 
+    def export_cause_effect_workbook(self) -> None:
+        if not self.repository:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Cause & Effect comparison",
+            "cause-effect-comparison.xlsx",
+            "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            export_cause_effect_comparison_xlsx(self.repository, path)
+            self.statusBar().showMessage(f"Exported {path}", 5000)
+        except Exception as error:
+            QMessageBox.critical(self, "Export failed", str(error))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def export_testing_workbook(self) -> None:
+        if not self.repository:
+            return
+        dialog = ZoneTestExportDialog(self.repository, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export output-group test workbook",
+            "output-group-testing.xlsx",
+            "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            export_testing_workbook(
+                self.repository,
+                path,
+                dialog.selected_zones(),
+            )
+            self.statusBar().showMessage(f"Exported {path}", 5000)
+        except Exception as error:
+            QMessageBox.critical(self, "Export failed", str(error))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def import_testing_workbook(self) -> None:
+        if not self.repository:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import completed output-group test workbook",
+            "",
+            "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            sessions = read_testing_workbook(path)
+            session_count, result_count = self.repository.import_test_sessions(
+                sessions
+            )
+            QMessageBox.information(
+                self,
+                "Test results imported",
+                f"Imported {session_count:,} zone test sessions and "
+                f"{result_count:,} output-group results.",
+            )
+            self.statusBar().showMessage(f"Imported test results from {path}", 5000)
+        except Exception as error:
+            QMessageBox.critical(self, "Import failed", str(error))
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def export_pdf(self) -> None:
         if not self.repository:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export tracked changes", "ncf-tracked-changes.pdf", "PDF (*.pdf)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export tracked changes",
+            "project-tracked-changes.pdf",
+            "PDF (*.pdf)",
+        )
         if path:
             try:
                 export_change_pdf(self.repository, path)

@@ -26,6 +26,26 @@ QTabWidget#ribbon QTabBar::tab:selected {
     color: #0f4c81;
     border-top: 3px solid #0d6efd;
 }
+QTabWidget::pane {
+    border: 1px solid #cbd5e1;
+    background: white;
+}
+QTabBar::tab {
+    background: #e9eff7;
+    color: #334155;
+    border: 1px solid #cbd5e1;
+    border-bottom: 0;
+    padding: 7px 14px;
+}
+QTabBar::tab:selected {
+    background: white;
+    color: #0f4c81;
+    border-top: 3px solid #0d6efd;
+}
+QTabBar::tab:hover {
+    background: #dce8f5;
+    color: #172033;
+}
 QFrame#ribbonGroup {
     background: white;
     border-right: 1px solid #e2e8f0;

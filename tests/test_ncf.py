@@ -1,3 +1,6 @@
+import json
+import struct
+import zipfile
 from pathlib import Path
 
 from firepanel.device_catalog import (
@@ -6,10 +9,234 @@ from firepanel.device_catalog import (
     catalogue_display_name,
     protocols_for_code,
 )
-from firepanel.ncf import parse_ncf
+from firepanel.ncf import (
+    parse_configuration,
+    parse_ncf,
+    read_configuration_cause_effect,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_skf_table(
+    archive: zipfile.ZipFile,
+    name: str,
+    rows: list[dict],
+    *,
+    current: dict[int, dict] | None = None,
+) -> None:
+    row_list = []
+    for row_id, row in enumerate(rows):
+        stored = {"RowID": row_id, "Original": row}
+        if current and row_id in current:
+            stored["Current"] = current[row_id]
+        row_list.append(stored)
+    document = {
+        "FDBS": {
+            "Version": 16,
+            "Manager": {
+                "UpdatesRegistry": True,
+                "TableList": [
+                    {
+                        "class": "Table",
+                        "Name": Path(name).stem,
+                        "ColumnList": [],
+                        "RowList": row_list,
+                    }
+                ],
+                "RelationList": [],
+            },
+        }
+    }
+    archive.writestr(name, json.dumps(document))
+
+
+def test_legacy_ncf_container_still_uses_binary_parser(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-format.ncf"
+    site = bytearray(336)
+    panel_name = b"Panel A"
+    site[112 + 8] = 0x12
+    site[112 + 9] = len(panel_name)
+    site[112 + 10 : 112 + 10 + len(panel_name)] = panel_name
+    site[112 + 44] = 5
+    struct.pack_into("<i", site, 224 + 8, 3)
+    struct.pack_into("<i", site, 224 + 12, 7)
+    zone_name = b"Legacy zone"
+    site[224 + 16] = len(zone_name)
+    site[224 + 17 : 224 + 17 + len(zone_name)] = zone_name
+
+    point = bytearray(224)
+    struct.pack_into("<i", point, 8, 2)
+    struct.pack_into("<i", point, 12, 45)
+    point[16] = 1
+    point[17] = 4
+    point[18] = 2
+    location = b"Legacy detector"
+    point[20] = len(location)
+    point[21 : 21 + len(location)] = location
+    struct.pack_into("<i", point, 48, 7)
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("SITE", site)
+        archive.writestr("Panel A.pcf", point)
+
+    parsed = parse_configuration(path)
+    assert len(parsed.panels) == 1
+    assert parsed.panels[0].node == 5
+    assert parsed.panels[0].name == "Panel A"
+    assert parsed.panels[0].point_sub_records == 1
+    assert len(parsed.devices) == 1
+    assert parsed.devices[0].stable_key == "5/2/4/1"
+    assert parsed.devices[0].text == "Legacy detector"
+    assert parsed.devices[0].observed_type == "Optical Smoke"
+    assert parsed.zones[0].description == "Legacy zone"
+
+
+def test_skf_json_tables_are_parsed_without_changing_legacy_api(tmp_path: Path) -> None:
+    path = tmp_path / "new-format.skf"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        _write_skf_table(
+            archive,
+            "tblNode.json",
+            [
+                {"NetworkAddress": 52, "NodeName": "Old panel name"},
+                {"NetworkAddress": 96, "NodeName": "Control repeater"},
+            ],
+            current={0: {"NodeName": "Main Entrance Panel 1"}},
+        )
+        _write_skf_table(
+            archive,
+            "tblPoint.json",
+            [
+                {
+                    "NetworkAddress": 52,
+                    "LoopNumber": 1,
+                    "LoopAddress": 1,
+                    "SubAddress": 1,
+                    "ZoneNumber": 179,
+                    "DeviceID": 39,
+                    "Measurement": 2,
+                    "OutputGroup": 0,
+                    "Location": "DUCT                ROOM 4",
+                },
+                {
+                    "NetworkAddress": 52,
+                    "LoopNumber": 1,
+                    "LoopAddress": 41,
+                    "SubAddress": 1,
+                    "ZoneNumber": 178,
+                    "DeviceID": 26,
+                    "Measurement": 11,
+                    "OutputGroup": 0,
+                    "Location": "Spare Input",
+                },
+                {
+                    "NetworkAddress": 52,
+                    "LoopNumber": 1,
+                    "LoopAddress": 41,
+                    "SubAddress": 3,
+                    "ZoneNumber": 178,
+                    "DeviceID": 26,
+                    "Measurement": 14,
+                    "OutputGroup": 50,
+                    "Location": "DOOR ACCESS RMO STAIRCASE",
+                },
+                {
+                    "NetworkAddress": 52,
+                    "LoopNumber": -90,
+                    "LoopAddress": 1,
+                    "SubAddress": 1,
+                    "ZoneNumber": 179,
+                    "DeviceID": 12,
+                    "Measurement": 12,
+                    "OutputGroup": 0,
+                    "Location": "Internal panel sounder",
+                },
+            ],
+        )
+        _write_skf_table(
+            archive,
+            "tblZone.json",
+            [
+                {"ZoneNumber": 178, "ZoneText": "PATH LAB GROUND FLOOR"},
+                {"ZoneNumber": 179, "ZoneText": "PATH LAB FIRST FLOOR"},
+            ],
+        )
+        _write_skf_table(
+            archive,
+            "tblOutputGroup.json",
+            [
+                {
+                    "NetworkAddress": 52,
+                    "GroupNo": 50,
+                    "GroupText": "PATHOLOGY ACCESS DOORS",
+                }
+            ],
+        )
+        _write_skf_table(
+            archive,
+            "tblOutputGroupLine.json",
+            [
+                {
+                    "NetworkAddress": 52,
+                    "GroupNo": 50,
+                    "Operation": 0,
+                    "OutputStyleNo": 0,
+                    "ZoneFrom": 179,
+                    "ZoneTo": 179,
+                    "ZoneQualifiers": 2049,
+                }
+            ],
+        )
+        _write_skf_table(
+            archive,
+            "tblRingingStyle.json",
+            [
+                {
+                    "NetworkAddress": 52,
+                    "StyleNumber": 0,
+                    "Description": "Evacuate",
+                }
+            ],
+        )
+
+    parsed = parse_configuration(path)
+    assert parse_ncf(path).sha256 == parsed.sha256
+    assert parsed.versions == ["SKF FDBS 16"]
+    assert len(parsed.panels) == 2
+    assert len(parsed.devices) == 2
+    assert sum(panel.point_sub_records for panel in parsed.panels) == 3
+
+    node_52 = next(panel for panel in parsed.panels if panel.node == 52)
+    assert node_52.name == "Main Entrance Panel 1"
+    assert node_52.loops == [1]
+    detector = next(device for device in node_52.devices if device.address == 1)
+    assert detector.text == "DUCT                ROOM 4"
+    assert detector.zone == 179
+    assert detector.observed_type == "Optical Smoke"
+
+    module = next(device for device in node_52.devices if device.address == 41)
+    assert [channel.sub_address for channel in module.channels] == [1, 3]
+    output = module.channels[1]
+    assert output.output_group == 50
+    assert output.output_group_name == "PATHOLOGY ACCESS DOORS"
+    assert output.ringing_style == "Evacuate"
+    assert output.observed_type == "Relay"
+
+    zone_179 = next(zone for zone in parsed.zones if zone.number == 179)
+    assert zone_179.description == "PATH LAB FIRST FLOOR"
+
+    cause_effect = read_configuration_cause_effect(path, [178, 179])
+    assert [(row.target_node, row.output_group) for row in cause_effect.output_groups] == [
+        (52, 50)
+    ]
+    assert len(cause_effect.activations) == 1
+    activation = cause_effect.activations[0]
+    assert activation.trigger_zone == "179"
+    assert activation.ringing_style == "E"
+    assert activation.ringing_style_name == "Evacuate"
+    assert activation.zone_qualifiers == 2049
 
 
 def test_supplied_ncf_inventory() -> None:

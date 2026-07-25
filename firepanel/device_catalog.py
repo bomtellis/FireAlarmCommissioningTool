@@ -84,6 +84,22 @@ KNOWN_CATALOGUE_CODES = (
     | ADDITIONAL_OBSERVED_CODES
 )
 
+# Generic engineering estimates in milliamps.  These are deliberately keyed by
+# the measurement/device types emitted by both importers so node power totals
+# use an explicit quiescent and alarm draw for every recognised type.
+DEVICE_CURRENT_MA: dict[str, tuple[float, float]] = {
+    "Ionisation Smoke": (0.28, 2.00),
+    "Optical Smoke": (0.50, 3.50),
+    "Multisensor": (0.50, 3.50),
+    "Heat Detector": (0.50, 3.50),
+    "Call Point": (0.25, 4.00),
+    "Input Module": (0.50, 4.00),
+    "Sounder": (0.30, 20.00),
+    "Relay": (1.50, 1.50),
+    "Visual Alarm Device": (0.50, 20.00),
+}
+DEFAULT_DEVICE_CURRENT_MA = (0.75, 0.75)
+
 
 def protocols_for_code(product_code: int) -> tuple[str, ...]:
     """Return protocols whose supplied catalogue contains *product_code*."""
@@ -106,3 +122,8 @@ def catalogue_display_name(product_code: int, observed_type: str | None = None) 
     if product_code in ADDITIONAL_OBSERVED_CODES:
         return f"ConfigTool catalogue code {product_code}"
     return f"Uncatalogued product code {product_code}"
+
+
+def device_current_ma(observed_type: str | None) -> tuple[float, float]:
+    """Return the quiescent and alarm current estimates for a device type."""
+    return DEVICE_CURRENT_MA.get(observed_type or "", DEFAULT_DEVICE_CURRENT_MA)

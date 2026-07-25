@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "firepanel-commissioning"
 version = "0.1.0"
-description = "Desktop commissioning workspace for Advanced MxPro NCF configurations"
+description = "Desktop commissioning workspace for Advanced MxPro NCF and SKF configurations"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-only" }

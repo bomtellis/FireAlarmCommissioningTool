@@ -9,11 +9,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from openpyxl.utils import get_column_letter
+
+from .cause_effect import (
+    CauseEffectWorkbook,
+    normalise_zone_key,
+    read_cause_effect_workbook,
+)
 from .models import Change, ParsedNcf
-from .ncf import parse_ncf
+from .ncf import parse_configuration, parse_ncf
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 
 SCHEMA = """
@@ -125,6 +132,80 @@ CREATE TABLE IF NOT EXISTS cause_effect_rules (
     notes TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS cause_effect_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    imported_at TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL UNIQUE,
+    activation_count INTEGER NOT NULL,
+    reference_count INTEGER NOT NULL,
+    matched_count INTEGER NOT NULL,
+    matrix_only_count INTEGER NOT NULL,
+    reference_only_count INTEGER NOT NULL,
+    activation_codes_json TEXT NOT NULL,
+    warnings_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cause_effect_output_groups (
+    import_id INTEGER NOT NULL REFERENCES cause_effect_imports(id) ON DELETE CASCADE,
+    target_node INTEGER NOT NULL,
+    target_node_name TEXT NOT NULL DEFAULT '',
+    output_group INTEGER NOT NULL,
+    output_group_name TEXT NOT NULL DEFAULT '',
+    source_column TEXT NOT NULL,
+    PRIMARY KEY (import_id, target_node, output_group)
+);
+
+CREATE TABLE IF NOT EXISTS cause_effect_activations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES cause_effect_imports(id) ON DELETE CASCADE,
+    trigger_zone TEXT NOT NULL,
+    trigger_zone_name TEXT NOT NULL DEFAULT '',
+    target_node INTEGER NOT NULL,
+    target_node_name TEXT NOT NULL DEFAULT '',
+    output_group INTEGER NOT NULL,
+    output_group_name TEXT NOT NULL DEFAULT '',
+    output_zone_name TEXT NOT NULL DEFAULT '',
+    ringing_style TEXT NOT NULL,
+    source_row INTEGER NOT NULL,
+    source_column TEXT NOT NULL,
+    reference_status TEXT NOT NULL DEFAULT 'matrix_only',
+    comments TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS ix_cause_effect_activations_import_zone
+    ON cause_effect_activations(import_id, trigger_zone);
+CREATE INDEX IF NOT EXISTS ix_cause_effect_activations_import_output
+    ON cause_effect_activations(import_id, target_node, output_group);
+
+CREATE TABLE IF NOT EXISTS cause_effect_reference_only (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES cause_effect_imports(id) ON DELETE CASCADE,
+    trigger_zone TEXT NOT NULL,
+    target_node INTEGER NOT NULL,
+    target_node_name TEXT NOT NULL DEFAULT '',
+    output_group INTEGER NOT NULL,
+    output_group_name TEXT NOT NULL DEFAULT '',
+    output_zone_name TEXT NOT NULL DEFAULT '',
+    ringing_style TEXT NOT NULL,
+    source_row INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cause_effect_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES cause_effect_imports(id) ON DELETE CASCADE,
+    entity TEXT NOT NULL,
+    stable_key TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    field TEXT,
+    old_value TEXT,
+    new_value TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_cause_effect_changes_import
+    ON cause_effect_changes(import_id, id);
+
 CREATE TABLE IF NOT EXISTS node_power (
     node INTEGER PRIMARY KEY,
     battery_ah REAL,
@@ -184,7 +265,7 @@ class ProjectRepository:
         repository = cls(project_path)
         repository.set_metadata("project_name", name)
         repository.set_metadata("created_at", _now())
-        repository.import_ncf(ncf_path)
+        repository.import_configuration(ncf_path)
         return repository
 
     def _initialise(self) -> None:
@@ -203,6 +284,7 @@ class ProjectRepository:
             )
         self._backfill_zone_descriptions()
         self._backfill_output_groups()
+        self._backfill_cause_effect_output_groups()
 
     def _backfill_zone_descriptions(self) -> None:
         """Populate projects created before SITE zone names were decoded."""
@@ -274,6 +356,42 @@ class ProjectRepository:
                 rows,
             )
 
+    def _backfill_cause_effect_output_groups(self) -> None:
+        """Retain empty matrix output columns in projects imported before v6."""
+        with self.connection() as connection:
+            latest = connection.execute(
+                """
+                SELECT id, source_path
+                FROM cause_effect_imports
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest is None:
+                return
+            populated = connection.execute(
+                """
+                SELECT 1
+                FROM cause_effect_output_groups
+                WHERE import_id = ?
+                LIMIT 1
+                """,
+                (latest["id"],),
+            ).fetchone()
+        source = Path(latest["source_path"])
+        if populated or not source.exists():
+            return
+        try:
+            parsed = read_cause_effect_workbook(source)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return
+        with self.connection() as connection:
+            self._insert_cause_effect_output_groups(
+                connection,
+                int(latest["id"]),
+                parsed,
+            )
+
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
@@ -318,8 +436,10 @@ class ProjectRepository:
             row = connection.execute("SELECT MAX(id) AS id FROM snapshots").fetchone()
         return int(row["id"]) if row and row["id"] is not None else None
 
-    def import_ncf(self, ncf_path: str | Path) -> tuple[int, list[Change]]:
-        parsed = parse_ncf(ncf_path)
+    def import_configuration(
+        self, configuration_path: str | Path
+    ) -> tuple[int, list[Change]]:
+        parsed = parse_configuration(configuration_path)
         with self.connection() as connection:
             existing = connection.execute(
                 "SELECT id FROM snapshots WHERE sha256 = ?", (parsed.sha256,)
@@ -367,6 +487,10 @@ class ProjectRepository:
                 ],
             )
         return snapshot_id, changes
+
+    def import_ncf(self, ncf_path: str | Path) -> tuple[int, list[Change]]:
+        """Backward-compatible alias for legacy callers."""
+        return self.import_configuration(ncf_path)
 
     @staticmethod
     def _insert_parsed(
@@ -596,15 +720,39 @@ class ProjectRepository:
             )
 
     def fetch_changes(self, snapshot_id: int | None = None) -> list[sqlite3.Row]:
+        requested_snapshot = snapshot_id
         snapshot_id = snapshot_id or self.latest_snapshot_id()
-        if snapshot_id is None:
-            return []
         with self.connection() as connection:
-            return list(
-                connection.execute(
-                    "SELECT * FROM changes WHERE snapshot_id = ? ORDER BY id", (snapshot_id,)
+            changes = (
+                list(
+                    connection.execute(
+                        "SELECT * FROM changes WHERE snapshot_id = ? ORDER BY id",
+                        (snapshot_id,),
+                    )
                 )
+                if snapshot_id is not None
+                else []
             )
+            if requested_snapshot is not None:
+                return changes
+            latest_import = connection.execute(
+                "SELECT MAX(id) AS id FROM cause_effect_imports"
+            ).fetchone()["id"]
+            if latest_import is not None:
+                changes.extend(
+                    connection.execute(
+                        """
+                        SELECT id, NULL AS snapshot_id, import_id,
+                               entity, stable_key, change_type,
+                               field, old_value, new_value
+                        FROM cause_effect_changes
+                        WHERE import_id = ?
+                        ORDER BY id
+                        """,
+                        (latest_import,),
+                    )
+                )
+            return changes
 
     def fetch_snapshots(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
@@ -617,6 +765,18 @@ class ProjectRepository:
                 (name, level_order, dxf_path),
             )
             return int(cursor.lastrowid)
+
+    def set_floor_dxf(self, floor_id: int, dxf_path: str | None) -> None:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE floors SET dxf_path = ? WHERE id = ?",
+                (
+                    str(Path(dxf_path).resolve()) if dxf_path else None,
+                    int(floor_id),
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("The selected floor no longer exists.")
 
     def fetch_floors(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
@@ -774,6 +934,572 @@ class ProjectRepository:
                 )
             )
 
+    def update_zone_geometry(
+        self,
+        geometry_id: int,
+        points: Iterable[tuple[float, float]],
+    ) -> None:
+        geometry_json = json.dumps([[float(x), float(y)] for x, y in points])
+        with self.connection() as connection:
+            connection.execute(
+                """
+                UPDATE zone_geometry
+                SET geometry_json = ?
+                WHERE id = ?
+                """,
+                (geometry_json, int(geometry_id)),
+            )
+
+    def reassign_zone_geometry(self, geometry_id: int, zone: int) -> None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT zone, floor_id FROM zone_geometry WHERE id = ?",
+                (int(geometry_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("The selected zone geometry no longer exists.")
+            existing = connection.execute(
+                """
+                SELECT id FROM zone_geometry
+                WHERE zone = ? AND floor_id = ? AND id <> ?
+                """,
+                (int(zone), int(row["floor_id"]), int(geometry_id)),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(
+                    "That zone already has an assigned polygon on this floor."
+                )
+            connection.execute(
+                "UPDATE zone_geometry SET zone = ? WHERE id = ?",
+                (int(zone), int(geometry_id)),
+            )
+            connection.execute(
+                "UPDATE zones SET floor_id = ? WHERE number = ?",
+                (int(row["floor_id"]), int(zone)),
+            )
+            old_zone_remaining = connection.execute(
+                "SELECT floor_id FROM zone_geometry WHERE zone = ? LIMIT 1",
+                (int(row["zone"]),),
+            ).fetchone()
+            connection.execute(
+                "UPDATE zones SET floor_id = ? WHERE number = ?",
+                (
+                    (
+                        int(old_zone_remaining["floor_id"])
+                        if old_zone_remaining is not None
+                        else None
+                    ),
+                    int(row["zone"]),
+                ),
+            )
+
+    def remove_zone_geometry(self, geometry_id: int) -> None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT zone, floor_id FROM zone_geometry WHERE id = ?",
+                (int(geometry_id),),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "DELETE FROM zone_geometry WHERE id = ?",
+                (int(geometry_id),),
+            )
+            remaining = connection.execute(
+                "SELECT 1 FROM zone_geometry WHERE zone = ? LIMIT 1",
+                (int(row["zone"]),),
+            ).fetchone()
+            if remaining is None:
+                connection.execute(
+                    "UPDATE zones SET floor_id = NULL WHERE number = ?",
+                    (int(row["zone"]),),
+                )
+
+    def import_cause_effect(
+        self, workbook_path: str | Path
+    ) -> tuple[int, CauseEffectWorkbook]:
+        parsed = read_cause_effect_workbook(workbook_path)
+        with self.connection() as connection:
+            existing = connection.execute(
+                "SELECT id FROM cause_effect_imports WHERE sha256 = ?",
+                (parsed.sha256,),
+            ).fetchone()
+            if existing:
+                return int(existing["id"]), parsed
+
+            previous_comments: dict[tuple[str, int, int, str], str] = {}
+            latest = connection.execute(
+                "SELECT MAX(id) AS id FROM cause_effect_imports"
+            ).fetchone()["id"]
+            if latest is not None:
+                for row in connection.execute(
+                    """
+                    SELECT trigger_zone, target_node, output_group, ringing_style,
+                           comments
+                    FROM cause_effect_activations
+                    WHERE import_id = ? AND TRIM(comments) <> ''
+                    """,
+                    (latest,),
+                ):
+                    previous_comments[
+                        (
+                            row["trigger_zone"],
+                            row["target_node"],
+                            row["output_group"],
+                            row["ringing_style"],
+                        )
+                    ] = row["comments"]
+
+            cursor = connection.execute(
+                """
+                INSERT INTO cause_effect_imports(
+                    imported_at, source_name, source_path, sha256,
+                    activation_count, reference_count, matched_count,
+                    matrix_only_count, reference_only_count,
+                    activation_codes_json, warnings_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now(),
+                    parsed.source.name,
+                    str(parsed.source),
+                    parsed.sha256,
+                    len(parsed.activations),
+                    parsed.reference_count,
+                    parsed.matched_count,
+                    parsed.matrix_only_count,
+                    parsed.reference_only_count,
+                    json.dumps(parsed.activation_codes),
+                    json.dumps(parsed.warnings),
+                ),
+            )
+            import_id = int(cursor.lastrowid)
+            self._insert_cause_effect_output_groups(
+                connection,
+                import_id,
+                parsed,
+            )
+            connection.executemany(
+                """
+                INSERT INTO cause_effect_activations(
+                    import_id, trigger_zone, trigger_zone_name,
+                    target_node, target_node_name, output_group,
+                    output_group_name, output_zone_name, ringing_style,
+                    source_row, source_column, reference_status, comments
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        import_id,
+                        activation.trigger_zone,
+                        activation.trigger_zone_name,
+                        activation.target_node,
+                        activation.target_node_name,
+                        activation.output_group,
+                        activation.output_group_name,
+                        activation.output_zone_name,
+                        activation.activation_code,
+                        activation.source_row,
+                        activation.source_column,
+                        activation.reference_status,
+                        previous_comments.get(
+                            (
+                                activation.trigger_zone,
+                                activation.target_node,
+                                activation.output_group,
+                                activation.activation_code,
+                            ),
+                            "",
+                        ),
+                    )
+                    for activation in parsed.activations
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO cause_effect_reference_only(
+                    import_id, trigger_zone, target_node, target_node_name,
+                    output_group, output_group_name, output_zone_name,
+                    ringing_style, source_row
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        import_id,
+                        reference.trigger_zone,
+                        reference.target_node,
+                        reference.target_node_name,
+                        reference.output_group,
+                        reference.output_group_name,
+                        reference.output_zone_name,
+                        reference.activation_code,
+                        reference.source_row,
+                    )
+                    for reference in parsed.reference_only
+                ],
+            )
+            changes = self._calculate_cause_effect_changes(
+                connection,
+                latest,
+                import_id,
+            )
+            connection.executemany(
+                """
+                INSERT INTO cause_effect_changes(
+                    import_id, entity, stable_key, change_type,
+                    field, old_value, new_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        import_id,
+                        change.entity,
+                        change.stable_key,
+                        change.change_type,
+                        change.field,
+                        change.old_value,
+                        change.new_value,
+                    )
+                    for change in changes
+                ],
+            )
+        return import_id, parsed
+
+    @staticmethod
+    def _insert_cause_effect_output_groups(
+        connection: sqlite3.Connection,
+        import_id: int,
+        parsed: CauseEffectWorkbook,
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO cause_effect_output_groups(
+                import_id, target_node, target_node_name,
+                output_group, output_group_name, source_column
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    import_id,
+                    output.target_node,
+                    output.target_node_name,
+                    output.output_group,
+                    output.output_group_name,
+                    get_column_letter(output.index + 1),
+                )
+                for output in parsed.output_groups
+            ],
+        )
+
+    @staticmethod
+    def _calculate_cause_effect_changes(
+        connection: sqlite3.Connection,
+        previous_import: int | None,
+        import_id: int,
+    ) -> list[Change]:
+        if previous_import is None:
+            count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM cause_effect_activations
+                WHERE import_id = ?
+                """,
+                (import_id,),
+            ).fetchone()["count"]
+            return [
+                Change(
+                    entity="cause_effect_matrix",
+                    stable_key=str(import_id),
+                    change_type="initial",
+                    field="activations",
+                    old_value=None,
+                    new_value=str(count),
+                )
+            ]
+
+        old_rows = {
+            _cause_effect_stable_key(row): row
+            for row in connection.execute(
+                """
+                SELECT * FROM cause_effect_activations
+                WHERE import_id = ?
+                """,
+                (previous_import,),
+            )
+        }
+        new_rows = {
+            _cause_effect_stable_key(row): row
+            for row in connection.execute(
+                """
+                SELECT * FROM cause_effect_activations
+                WHERE import_id = ?
+                """,
+                (import_id,),
+            )
+        }
+        old_outputs = {
+            _cause_effect_output_key(row): row
+            for row in connection.execute(
+                """
+                SELECT * FROM cause_effect_output_groups
+                WHERE import_id = ?
+                """,
+                (previous_import,),
+            )
+        }
+        new_outputs = {
+            _cause_effect_output_key(row): row
+            for row in connection.execute(
+                """
+                SELECT * FROM cause_effect_output_groups
+                WHERE import_id = ?
+                """,
+                (import_id,),
+            )
+        }
+        changes: list[Change] = []
+        for key in sorted(new_rows.keys() - old_rows.keys()):
+            changes.append(
+                Change(
+                    "cause_effect_activation",
+                    key,
+                    "added",
+                    None,
+                    None,
+                    _cause_effect_activation_summary(new_rows[key]),
+                )
+            )
+        for key in sorted(old_rows.keys() - new_rows.keys()):
+            changes.append(
+                Change(
+                    "cause_effect_activation",
+                    key,
+                    "removed",
+                    None,
+                    _cause_effect_activation_summary(old_rows[key]),
+                    None,
+                )
+            )
+        for key in sorted(old_rows.keys() & new_rows.keys()):
+            old_value = old_rows[key]["ringing_style"]
+            new_value = new_rows[key]["ringing_style"]
+            if old_value != new_value:
+                changes.append(
+                    Change(
+                        "cause_effect_activation",
+                        key,
+                        "modified",
+                        "ringing_style",
+                        _stringify(old_value),
+                        _stringify(new_value),
+                    )
+                )
+
+        for key in sorted(new_outputs.keys() - old_outputs.keys()):
+            changes.append(
+                Change(
+                    "cause_effect_output_group",
+                    key,
+                    "added",
+                    None,
+                    None,
+                    _cause_effect_output_summary(new_outputs[key]),
+                )
+            )
+        for key in sorted(old_outputs.keys() - new_outputs.keys()):
+            changes.append(
+                Change(
+                    "cause_effect_output_group",
+                    key,
+                    "removed",
+                    None,
+                    _cause_effect_output_summary(old_outputs[key]),
+                    None,
+                )
+            )
+        for key in sorted(old_outputs.keys() & new_outputs.keys()):
+            old_name = old_outputs[key]["output_group_name"]
+            new_name = new_outputs[key]["output_group_name"]
+            if old_name != new_name:
+                changes.append(
+                    Change(
+                        "cause_effect_output_group",
+                        key,
+                        "modified",
+                        "output_group_name",
+                        _stringify(old_name),
+                        _stringify(new_name),
+                    )
+                )
+
+        label_specs = (
+            (
+                "cause_effect_zone",
+                "trigger_zone_name",
+                old_rows.values(),
+                new_rows.values(),
+                lambda row: f"zone {row['trigger_zone']}",
+            ),
+            (
+                "cause_effect_node",
+                "target_node_name",
+                old_outputs.values(),
+                new_outputs.values(),
+                lambda row: f"node {row['target_node']}",
+            ),
+        )
+        for entity, field, old_values, new_values, key_for_row in label_specs:
+            old_labels = {key_for_row(row): row[field] for row in old_values}
+            new_labels = {key_for_row(row): row[field] for row in new_values}
+            for key in sorted(old_labels.keys() & new_labels.keys()):
+                if old_labels[key] != new_labels[key]:
+                    changes.append(
+                        Change(
+                            entity,
+                            key,
+                            "modified",
+                            field,
+                            _stringify(old_labels[key]),
+                            _stringify(new_labels[key]),
+                        )
+                    )
+        return changes
+
+    def fetch_cause_effect_changes(
+        self,
+        import_id: int | None = None,
+    ) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            if import_id is None:
+                import_id = connection.execute(
+                    "SELECT MAX(id) AS id FROM cause_effect_imports"
+                ).fetchone()["id"]
+            if import_id is None:
+                return []
+            return list(
+                connection.execute(
+                    """
+                    SELECT * FROM cause_effect_changes
+                    WHERE import_id = ?
+                    ORDER BY id
+                    """,
+                    (import_id,),
+                )
+            )
+
+    def latest_cause_effect_import(self) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM cause_effect_imports ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+    def fetch_cause_effect_output_groups(self) -> list[sqlite3.Row]:
+        latest = self.latest_cause_effect_import()
+        if latest is None:
+            return []
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT * FROM cause_effect_output_groups
+                    WHERE import_id = ?
+                    ORDER BY target_node, output_group
+                    """,
+                    (latest["id"],),
+                )
+            )
+
+    def fetch_cause_effect_activations(
+        self,
+        trigger_zone: object | None = None,
+        scope_node: int | None = None,
+    ) -> list[sqlite3.Row]:
+        latest = self.latest_cause_effect_import()
+        if latest is None:
+            return []
+        clauses = ["import_id = ?"]
+        parameters: list[object] = [latest["id"]]
+        if trigger_zone is not None:
+            clauses.append("trigger_zone = ?")
+            parameters.append(normalise_zone_key(trigger_zone))
+        if scope_node is not None:
+            clauses.append("target_node = ?")
+            parameters.append(int(scope_node))
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    f"""
+                    SELECT * FROM cause_effect_activations
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY CASE
+                                 WHEN trigger_zone GLOB '[0-9]*' THEN 0
+                                 ELSE 1
+                             END,
+                             CAST(trigger_zone AS REAL), trigger_zone,
+                             target_node, output_group, id
+                    """,
+                    parameters,
+                )
+            )
+
+    def fetch_cause_effect_trigger_zones(self) -> list[sqlite3.Row]:
+        latest = self.latest_cause_effect_import()
+        if latest is None:
+            return []
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT trigger_zone,
+                           MAX(trigger_zone_name) AS trigger_zone_name,
+                           COUNT(*) AS activation_count
+                    FROM cause_effect_activations
+                    WHERE import_id = ?
+                    GROUP BY trigger_zone
+                    ORDER BY CASE
+                                 WHEN trigger_zone GLOB '[0-9]*' THEN 0
+                                 ELSE 1
+                             END,
+                             CAST(trigger_zone AS REAL), trigger_zone
+                    """,
+                    (latest["id"],),
+                )
+            )
+
+    def fetch_cause_effect_reference_only(self) -> list[sqlite3.Row]:
+        latest = self.latest_cause_effect_import()
+        if latest is None:
+            return []
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT * FROM cause_effect_reference_only
+                    WHERE import_id = ?
+                    ORDER BY source_row, id
+                    """,
+                    (latest["id"],),
+                )
+            )
+
+    def update_cause_effect_comment(
+        self,
+        activation_id: int,
+        comments: str,
+    ) -> None:
+        latest = self.latest_cause_effect_import()
+        if latest is None:
+            return
+        with self.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cause_effect_activations
+                SET comments = ?
+                WHERE id = ? AND import_id = ?
+                """,
+                (comments.strip(), int(activation_id), latest["id"]),
+            )
+
     def add_rule(
         self,
         name: str,
@@ -839,7 +1565,7 @@ class ProjectRepository:
         self,
         engineer: str,
         scope_node: int | None,
-        trigger_zone: int,
+        trigger_zone: int | float | str,
         results: Iterable[tuple[str | None, str, str, str]],
         notes: str = "",
     ) -> int:
@@ -890,6 +1616,82 @@ class ProjectRepository:
                 )
             )
 
+    def import_test_sessions(self, sessions) -> tuple[int, int]:
+        """Append spreadsheet test sessions and their output-group results."""
+        session_count = 0
+        result_count = 0
+        with self.connection() as connection:
+            for session in sessions:
+                notes = str(session.notes or "").strip()
+                audit_note = f"Imported workbook session: {session.session_key}"
+                notes = f"{notes}\n{audit_note}".strip()
+                cursor = connection.execute(
+                    """
+                    INSERT INTO test_sessions(
+                        started_at, completed_at, engineer, scope_node, notes
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _now(),
+                        _now(),
+                        session.engineer,
+                        session.scope_node,
+                        notes,
+                    ),
+                )
+                session_id = int(cursor.lastrowid)
+                rows = [
+                    (
+                        session_id,
+                        session.trigger_zone,
+                        stable_key,
+                        expected_state,
+                        actual_state,
+                        result,
+                        comments,
+                        tested_at or _now(),
+                    )
+                    for (
+                        stable_key,
+                        expected_state,
+                        actual_state,
+                        result,
+                        comments,
+                        tested_at,
+                    ) in session.results
+                ]
+                connection.executemany(
+                    """
+                    INSERT INTO test_results(
+                        session_id, trigger_zone, stable_key, expected_state,
+                        actual_state, result, comments, tested_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                session_count += 1
+                result_count += len(rows)
+        return session_count, result_count
+
+    def fetch_test_results(self, session_id: int | None = None) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            if session_id is None:
+                return list(
+                    connection.execute(
+                        "SELECT * FROM test_results ORDER BY session_id, id"
+                    )
+                )
+            return list(
+                connection.execute(
+                    """
+                    SELECT * FROM test_results
+                    WHERE session_id = ?
+                    ORDER BY id
+                    """,
+                    (int(session_id),),
+                )
+            )
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -897,6 +1699,30 @@ def _now() -> str:
 
 def _stringify(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _cause_effect_stable_key(row: sqlite3.Row) -> str:
+    return (
+        f"zone {row['trigger_zone']} -> "
+        f"node {row['target_node']}/group {row['output_group']}"
+    )
+
+
+def _cause_effect_activation_summary(row: sqlite3.Row) -> str:
+    ringing_style = str(row["ringing_style"] or "Not specified")
+    output_name = str(row["output_group_name"] or "").strip()
+    return (
+        f"{ringing_style}"
+        f"{' - ' + output_name if output_name else ''}"
+    )
+
+
+def _cause_effect_output_key(row: sqlite3.Row) -> str:
+    return f"node {row['target_node']}/group {row['output_group']}"
+
+
+def _cause_effect_output_summary(row: sqlite3.Row) -> str:
+    return str(row["output_group_name"] or "Unnamed output group")
 
 
 def _normalise_test_result(value: str) -> str:

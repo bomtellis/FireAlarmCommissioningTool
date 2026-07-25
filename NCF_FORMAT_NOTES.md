@@ -1,4 +1,7 @@
-# Leighton-Site.NCF format notes
+# Leighton-Site.NCF legacy format notes
+
+These notes cover the binary NCF/PCF layout. Newer SKF JSON exports are
+documented separately in [SKF_FORMAT_NOTES.md](SKF_FORMAT_NOTES.md).
 
 ## Identification
 

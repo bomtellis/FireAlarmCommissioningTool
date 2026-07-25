@@ -1,31 +1,46 @@
 # FirePanel Commissioning
 
 FirePanel Commissioning is a local-first Python desktop application for turning
-Advanced MxPro network configuration (`.NCF`) files into a traceable
-commissioning project.
+Advanced MxPro network configuration files into a traceable commissioning
+project. It supports both legacy ConfigTool `.NCF` files and newer `.SKF`
+exports.
 
 The application is licensed under the GNU Affero General Public License v3.0.
 
 ## Current capabilities
 
-- Create a project from an NCF and retain immutable configuration snapshots.
-- Import an updated NCF and identify added, removed and modified point records.
+- Create a project from an NCF or SKF file and retain immutable configuration snapshots.
+- Import an updated NCF or SKF and identify added, removed and modified point records.
 - Export a signed-review-style tracked changes PDF.
-- Browse nodes, loops, addresses, sub-addresses, zones and observed device types.
-- Estimate loop current and battery autonomy using editable project assumptions.
+- Browse naturally sorted nodes, loops, addresses, sub-addresses, zones and observed device types.
+- Review zone numbers, descriptions and physical device counts in a dedicated Zones view.
+- Filter every table by right-clicking any column heading.
+- Calculate separate quiescent and alarm current totals per node and estimate
+  battery autonomy using editable project assumptions.
 - Import closed DXF polylines, create floors and assign shapes to zones.
 - Render the DXF as a persistent floor-plan underlay and place imported
   detectors, call points, sounders, output devices, power supplies and panels
   directly on it.
+- Display DXF text, toggle drawing layers, and create or edit zone polygons by
+  moving, rotating, realigning, reassigning or unassigning them.
 - Select a placed symbol to inspect its node, zone, loop, address, sub-address
   and any decoded output-group relationships.
 - Suggest same-floor and directly-above/below alert zones from drawing geometry.
 - Add custom rules for doors straddling zones, output groups, HVAC, lifts and
   other ancillary interfaces.
+- Import a Cause & Effect `.xlsx` matrix as zone-triggered output-group
+  activations while preserving its ringing-style codes.
+- Check matrix-derived activations against the workbook's `OutputGroupInfo`
+  sheet, expose both directions of mismatch, and retain filterable engineer
+  comments.
 - Simulate a fire by zone for the whole site or an individual panel.
 - Visualise normal zones in green, the origin/evacuate zone in red and
   adjacent/alert zones in yellow.
 - Export the device schedule to an Excel commissioning workbook.
+- Export selected or all fire-call zones to an output-group testing workbook,
+  with controlled result fields that can be imported back into test sessions.
+- Export configuration/imported Cause & Effect matrices and their differences
+  as separate sheets in one comparison workbook.
 
 ## Firecode basis
 
@@ -61,23 +76,26 @@ python main.py
 
 ## Project format
 
-A project is a single SQLite database using the `.fcp` extension. NCF snapshots,
-panels and devices are stored alongside project-owned drawings, geometry, rules,
-power assumptions and commissioning results.
+A project is a single SQLite database using the `.fcp` extension. Configuration
+snapshots, panels and devices are stored alongside project-owned drawings,
+geometry, rules, power assumptions and commissioning results.
 
-The original NCF is never modified. Re-importing an identical file is detected
-by SHA-256 and does not create a duplicate snapshot.
+The original NCF or SKF is never modified. Re-importing an identical file is
+detected by SHA-256 and does not create a duplicate snapshot.
 
 ## Known parser boundary
 
-The current read-only parser reliably imports the SITE node table and the
-224-byte loop point records validated against the supplied node 52 ConfigTool
-export.
+The read-only parser detects the format from archive contents rather than the
+filename:
 
-The proprietary fields for native output-group assignment and the original
-ConfigTool cause-and-effect program have not yet been decoded. Output groups
-and rules are therefore nullable/editable project data in this first version.
-The application does not claim that generated rules reproduce the source NCF
-cause-and-effect until those sections are decoded and validated.
+- Legacy NCF: imports the SITE node table and 224-byte PCF loop-point records.
+- Newer SKF: imports FireDAC JSON node, point, zone, output-group and ringing-style tables.
 
-See [NCF_FORMAT_NOTES.md](NCF_FORMAT_NOTES.md) for the observed binary layout.
+Native point output-group assignments and ringing styles are imported from both
+formats. The application does not translate the complete cause-and-effect
+program embedded in an NCF or SKF into editable project rules; an approved
+Cause & Effect Excel matrix can instead be imported and checked against its
+`OutputGroupInfo` tab.
+
+See [NCF_FORMAT_NOTES.md](NCF_FORMAT_NOTES.md) and
+[SKF_FORMAT_NOTES.md](SKF_FORMAT_NOTES.md) for the observed layouts.
