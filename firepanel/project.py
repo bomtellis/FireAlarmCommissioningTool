@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
+import re
 import shutil
 import sqlite3
 import zipfile
@@ -20,7 +23,7 @@ from .models import Change, ParsedNcf
 from .ncf import parse_configuration, parse_ncf
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 12
 
 
 SCHEMA = """
@@ -100,6 +103,14 @@ CREATE TABLE IF NOT EXISTS zone_geometry (
     UNIQUE(zone, floor_id)
 );
 
+CREATE TABLE IF NOT EXISTS ignored_zone_shapes (
+    floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+    shape_key TEXT NOT NULL,
+    geometry_json TEXT NOT NULL,
+    source_layer TEXT,
+    PRIMARY KEY (floor_id, shape_key)
+);
+
 CREATE TABLE IF NOT EXISTS map_assets (
     entity_kind TEXT NOT NULL CHECK(entity_kind IN ('device', 'panel')),
     entity_key TEXT NOT NULL,
@@ -113,10 +124,73 @@ CREATE TABLE IF NOT EXISTS map_assets (
 CREATE INDEX IF NOT EXISTS ix_map_assets_floor
     ON map_assets(floor_id);
 
+CREATE TABLE IF NOT EXISTS doors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+    start_x REAL NOT NULL,
+    start_y REAL NOT NULL,
+    end_x REAL NOT NULL,
+    end_y REAL NOT NULL,
+    zone_a INTEGER NOT NULL REFERENCES zones(number),
+    zone_b INTEGER NOT NULL REFERENCES zones(number),
+    has_access_control INTEGER NOT NULL DEFAULT 0,
+    access_device_key TEXT,
+    access_normal_state TEXT NOT NULL DEFAULT 'LOCKED'
+        CHECK(access_normal_state IN ('LOCKED', 'UNLOCKED')),
+    has_hold_open INTEGER NOT NULL DEFAULT 0,
+    hold_open_device_key TEXT,
+    hold_open_normal_state TEXT NOT NULL DEFAULT 'HELD OPEN'
+        CHECK(hold_open_normal_state IN ('HELD OPEN', 'CLOSED')),
+    door_type TEXT NOT NULL DEFAULT 'SINGLE'
+        CHECK(door_type IN ('SINGLE', 'DOUBLE')),
+    sprite_x REAL,
+    sprite_y REAL,
+    rotation_degrees REAL NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    CHECK(has_access_control = 1 OR has_hold_open = 1)
+);
+
+CREATE INDEX IF NOT EXISTS ix_doors_floor
+    ON doors(floor_id);
+CREATE INDEX IF NOT EXISTS ix_doors_zones
+    ON doors(zone_a, zone_b);
+
 CREATE TABLE IF NOT EXISTS output_groups (
     number INTEGER PRIMARY KEY,
     name TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS output_group_zone_assignments (
+    node INTEGER NOT NULL,
+    output_group INTEGER NOT NULL,
+    zone INTEGER NOT NULL REFERENCES zones(number) ON DELETE CASCADE,
+    output_kind TEXT NOT NULL
+        CHECK(output_kind IN ('SOUNDER', 'BEACON')),
+    PRIMARY KEY (node, output_group, zone, output_kind)
+);
+
+CREATE TABLE IF NOT EXISTS configuration_output_group_lines (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    source_row INTEGER NOT NULL,
+    target_node INTEGER NOT NULL,
+    target_node_name TEXT NOT NULL DEFAULT '',
+    output_group INTEGER NOT NULL,
+    output_group_name TEXT NOT NULL DEFAULT '',
+    operation INTEGER NOT NULL,
+    output_style_number INTEGER NOT NULL,
+    ringing_style TEXT NOT NULL DEFAULT '',
+    ringing_style_name TEXT NOT NULL DEFAULT '',
+    zone_from INTEGER NOT NULL,
+    zone_to INTEGER NOT NULL,
+    zone_qualifiers INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, source_row, target_node, output_group)
+);
+
+CREATE INDEX IF NOT EXISTS ix_configuration_output_group_zone_range
+    ON configuration_output_group_lines(
+        snapshot_id, zone_from, zone_to, target_node
+    );
 
 CREATE TABLE IF NOT EXISTS cause_effect_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,7 +319,33 @@ CREATE TABLE IF NOT EXISTS test_results (
     comments TEXT NOT NULL DEFAULT '',
     tested_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS project_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    changed_at TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    record_key TEXT NOT NULL,
+    change_type TEXT NOT NULL
+        CHECK(change_type IN ('added', 'modified', 'removed')),
+    old_values_json TEXT,
+    new_values_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_project_audit_log_changed_at
+    ON project_audit_log(changed_at, id);
 """
+
+
+def zone_shape_key(points: Iterable[tuple[float, float]]) -> str:
+    canonical = [
+        [round(float(x), 5), round(float(y), 5)]
+        for x, y in points
+    ]
+    payload = json.dumps(
+        canonical,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class ProjectRepository:
@@ -278,13 +378,211 @@ class ProjectRepository:
                 connection.execute("ALTER TABLE devices ADD COLUMN output_group_name TEXT")
             if "ringing_style" not in device_columns:
                 connection.execute("ALTER TABLE devices ADD COLUMN ringing_style TEXT")
+            door_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(doors)")
+            }
+            if "door_type" not in door_columns:
+                connection.execute(
+                    "ALTER TABLE doors ADD COLUMN door_type TEXT NOT NULL DEFAULT 'SINGLE'"
+                )
+            if "sprite_x" not in door_columns:
+                connection.execute("ALTER TABLE doors ADD COLUMN sprite_x REAL")
+            if "sprite_y" not in door_columns:
+                connection.execute("ALTER TABLE doors ADD COLUMN sprite_y REAL")
+            if "rotation_degrees" not in door_columns:
+                connection.execute(
+                    "ALTER TABLE doors ADD COLUMN rotation_degrees REAL NOT NULL DEFAULT 0"
+                )
+            self._migrate_internal_zone_doors(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
+                """
+                UPDATE doors
+                SET sprite_x = (start_x + end_x) / 2.0,
+                    sprite_y = (start_y + end_y) / 2.0
+                WHERE sprite_x IS NULL OR sprite_y IS NULL
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                WHERE metadata.value IS NOT excluded.value
+                """,
                 (str(SCHEMA_VERSION),),
             )
         self._backfill_zone_descriptions()
         self._backfill_output_groups()
         self._backfill_cause_effect_output_groups()
+        self._backfill_configuration_output_group_lines()
+        self._backfill_configuration_output_group_changes()
+        self._initialise_audit_triggers()
+
+    def _initialise_audit_triggers(self) -> None:
+        auditable_tables = (
+            "metadata",
+            "snapshots",
+            "zones",
+            "floors",
+            "zone_geometry",
+            "ignored_zone_shapes",
+            "map_assets",
+            "doors",
+            "output_groups",
+            "output_group_zone_assignments",
+            "cause_effect_rules",
+            "cause_effect_imports",
+            "cause_effect_activations",
+            "node_power",
+            "test_sessions",
+            "test_results",
+        )
+        with self.connection() as connection:
+            for table in auditable_tables:
+                columns = list(
+                    connection.execute(f'PRAGMA table_info("{table}")')
+                )
+                if not columns:
+                    continue
+                names = [str(column["name"]) for column in columns]
+                primary_keys = [
+                    str(column["name"])
+                    for column in sorted(
+                        columns,
+                        key=lambda column: int(column["pk"]),
+                    )
+                    if int(column["pk"]) > 0
+                ]
+                key_names = primary_keys or names[:1]
+
+                def json_expression(prefix: str, selected: list[str]) -> str:
+                    values = ", ".join(
+                        f"'{name}', {prefix}.\"{name}\""
+                        for name in selected
+                    )
+                    return f"json_object({values})"
+
+                new_values = json_expression("NEW", names)
+                old_values = json_expression("OLD", names)
+                new_key = json_expression("NEW", key_names)
+                old_key = json_expression("OLD", key_names)
+                changed = " OR ".join(
+                    f'OLD."{name}" IS NOT NEW."{name}"'
+                    for name in names
+                )
+                trigger_prefix = f"audit_{table}"
+                connection.executescript(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS "{trigger_prefix}_insert"
+                    AFTER INSERT ON "{table}"
+                    BEGIN
+                        INSERT INTO project_audit_log(
+                            changed_at, table_name, record_key, change_type,
+                            old_values_json, new_values_json
+                        ) VALUES (
+                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            '{table}', {new_key}, 'added', NULL, {new_values}
+                        );
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS "{trigger_prefix}_update"
+                    AFTER UPDATE ON "{table}"
+                    WHEN {changed}
+                    BEGIN
+                        INSERT INTO project_audit_log(
+                            changed_at, table_name, record_key, change_type,
+                            old_values_json, new_values_json
+                        ) VALUES (
+                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            '{table}', {new_key}, 'modified',
+                            {old_values}, {new_values}
+                        );
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS "{trigger_prefix}_delete"
+                    AFTER DELETE ON "{table}"
+                    BEGIN
+                        INSERT INTO project_audit_log(
+                            changed_at, table_name, record_key, change_type,
+                            old_values_json, new_values_json
+                        ) VALUES (
+                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            '{table}', {old_key}, 'removed', {old_values}, NULL
+                        );
+                    END;
+                    """
+                )
+
+    @staticmethod
+    def _migrate_internal_zone_doors(connection: sqlite3.Connection) -> None:
+        schema_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'doors'"
+        ).fetchone()
+        normalised_schema = re.sub(
+            r"\s+",
+            "",
+            str(schema_row["sql"] if schema_row else ""),
+        ).upper()
+        if "CHECK(ZONE_A<>ZONE_B)" not in normalised_schema:
+            return
+        connection.execute("DROP INDEX IF EXISTS ix_doors_floor")
+        connection.execute("DROP INDEX IF EXISTS ix_doors_zones")
+        connection.execute("ALTER TABLE doors RENAME TO doors_distinct_zone_legacy")
+        connection.execute(
+            """
+            CREATE TABLE doors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+                start_x REAL NOT NULL,
+                start_y REAL NOT NULL,
+                end_x REAL NOT NULL,
+                end_y REAL NOT NULL,
+                zone_a INTEGER NOT NULL REFERENCES zones(number),
+                zone_b INTEGER NOT NULL REFERENCES zones(number),
+                has_access_control INTEGER NOT NULL DEFAULT 0,
+                access_device_key TEXT,
+                access_normal_state TEXT NOT NULL DEFAULT 'LOCKED'
+                    CHECK(access_normal_state IN ('LOCKED', 'UNLOCKED')),
+                has_hold_open INTEGER NOT NULL DEFAULT 0,
+                hold_open_device_key TEXT,
+                hold_open_normal_state TEXT NOT NULL DEFAULT 'HELD OPEN'
+                    CHECK(hold_open_normal_state IN ('HELD OPEN', 'CLOSED')),
+                door_type TEXT NOT NULL DEFAULT 'SINGLE'
+                    CHECK(door_type IN ('SINGLE', 'DOUBLE')),
+                sprite_x REAL,
+                sprite_y REAL,
+                rotation_degrees REAL NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                CHECK(has_access_control = 1 OR has_hold_open = 1)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO doors(
+                id, name, floor_id, start_x, start_y, end_x, end_y,
+                zone_a, zone_b, has_access_control, access_device_key,
+                access_normal_state, has_hold_open, hold_open_device_key,
+                hold_open_normal_state, door_type, sprite_x, sprite_y,
+                rotation_degrees, notes
+            )
+            SELECT
+                id, name, floor_id, start_x, start_y, end_x, end_y,
+                zone_a, zone_b, has_access_control, access_device_key,
+                access_normal_state, has_hold_open, hold_open_device_key,
+                hold_open_normal_state, door_type, sprite_x, sprite_y,
+                rotation_degrees, notes
+            FROM doors_distinct_zone_legacy
+            """
+        )
+        connection.execute("DROP TABLE doors_distinct_zone_legacy")
+        connection.execute(
+            "CREATE INDEX ix_doors_floor ON doors(floor_id)"
+        )
+        connection.execute(
+            "CREATE INDEX ix_doors_zones ON doors(zone_a, zone_b)"
+        )
 
     def _backfill_zone_descriptions(self) -> None:
         """Populate projects created before SITE zone names were decoded."""
@@ -391,6 +689,167 @@ class ProjectRepository:
                 int(latest["id"]),
                 parsed,
             )
+
+    def _backfill_configuration_output_group_lines(self) -> None:
+        with self.connection() as connection:
+            snapshot = connection.execute(
+                """
+                SELECT id, source_path
+                FROM snapshots
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if snapshot is None:
+                return
+            populated = connection.execute(
+                """
+                SELECT 1
+                FROM configuration_output_group_lines
+                WHERE snapshot_id = ?
+                LIMIT 1
+                """,
+                (snapshot["id"],),
+            ).fetchone()
+        source = Path(snapshot["source_path"])
+        if populated or not source.exists():
+            return
+        try:
+            parsed = parse_configuration(source)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return
+        if not parsed.output_group_lines:
+            return
+        with self.connection() as connection:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO configuration_output_group_lines(
+                    snapshot_id, source_row, target_node, target_node_name,
+                    output_group, output_group_name, operation,
+                    output_style_number, ringing_style, ringing_style_name,
+                    zone_from, zone_to, zone_qualifiers
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        int(snapshot["id"]),
+                        line.source_row,
+                        line.target_node,
+                        line.target_node_name,
+                        line.output_group,
+                        line.output_group_name,
+                        line.operation,
+                        line.output_style_number,
+                        line.ringing_style,
+                        line.ringing_style_name,
+                        line.zone_from,
+                        line.zone_to,
+                        line.zone_qualifiers,
+                    )
+                    for line in parsed.output_group_lines
+                ],
+            )
+
+    def _backfill_configuration_output_group_changes(self) -> None:
+        with self.connection() as connection:
+            snapshot_ids = [
+                int(row["snapshot_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT snapshot_id
+                    FROM configuration_output_group_lines
+                    ORDER BY snapshot_id
+                    """
+                )
+            ]
+            previous_snapshot = None
+            for snapshot_id in snapshot_ids:
+                if previous_snapshot is None:
+                    count = connection.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM (
+                            SELECT target_node, output_group
+                            FROM configuration_output_group_lines
+                            WHERE snapshot_id = ?
+                            GROUP BY target_node, output_group
+                        )
+                        """,
+                        (snapshot_id,),
+                    ).fetchone()["count"]
+                    generated = [
+                        Change(
+                            "snapshot",
+                            str(snapshot_id),
+                            "initial",
+                            "output_groups",
+                            None,
+                            str(count),
+                        )
+                    ]
+                else:
+                    generated = [
+                        change
+                        for change in self._calculate_changes(
+                            connection,
+                            previous_snapshot,
+                            snapshot_id,
+                        )
+                        if change.entity == "output_group"
+                    ]
+                existing = {
+                    (
+                        row["entity"],
+                        row["stable_key"],
+                        row["change_type"],
+                        row["field"],
+                        row["old_value"],
+                        row["new_value"],
+                    )
+                    for row in connection.execute(
+                        """
+                        SELECT entity, stable_key, change_type, field,
+                               old_value, new_value
+                        FROM changes
+                        WHERE snapshot_id = ?
+                        """,
+                        (snapshot_id,),
+                    )
+                }
+                missing = [
+                    change
+                    for change in generated
+                    if (
+                        change.entity,
+                        change.stable_key,
+                        change.change_type,
+                        change.field,
+                        change.old_value,
+                        change.new_value,
+                    )
+                    not in existing
+                ]
+                connection.executemany(
+                    """
+                    INSERT INTO changes(
+                        snapshot_id, entity, stable_key, change_type,
+                        field, old_value, new_value
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            snapshot_id,
+                            change.entity,
+                            change.stable_key,
+                            change.change_type,
+                            change.field,
+                            change.old_value,
+                            change.new_value,
+                        )
+                        for change in missing
+                    ],
+                )
+                previous_snapshot = snapshot_id
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -551,6 +1010,34 @@ class ProjectRepository:
             """,
             device_rows,
         )
+        connection.executemany(
+            """
+            INSERT INTO configuration_output_group_lines(
+                snapshot_id, source_row, target_node, target_node_name,
+                output_group, output_group_name, operation,
+                output_style_number, ringing_style, ringing_style_name,
+                zone_from, zone_to, zone_qualifiers
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    snapshot_id,
+                    line.source_row,
+                    line.target_node,
+                    line.target_node_name,
+                    line.output_group,
+                    line.output_group_name,
+                    line.operation,
+                    line.output_style_number,
+                    line.ringing_style,
+                    line.ringing_style_name,
+                    line.zone_from,
+                    line.zone_to,
+                    line.zone_qualifiers,
+                )
+                for line in parsed.output_group_lines
+            ],
+        )
         ProjectRepository._upsert_zones(connection, parsed)
 
     @staticmethod
@@ -577,6 +1064,18 @@ class ProjectRepository:
             count = connection.execute(
                 "SELECT COUNT(*) AS count FROM devices WHERE snapshot_id = ?", (snapshot_id,)
             ).fetchone()["count"]
+            output_group_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM (
+                    SELECT target_node, output_group
+                    FROM configuration_output_group_lines
+                    WHERE snapshot_id = ?
+                    GROUP BY target_node, output_group
+                )
+                """,
+                (snapshot_id,),
+            ).fetchone()["count"]
             return [
                 Change(
                     entity="snapshot",
@@ -585,10 +1084,27 @@ class ProjectRepository:
                     field="devices",
                     old_value=None,
                     new_value=str(count),
-                )
+                ),
+                Change(
+                    entity="snapshot",
+                    stable_key=str(snapshot_id),
+                    change_type="initial",
+                    field="output_groups",
+                    old_value=None,
+                    new_value=str(output_group_count),
+                ),
             ]
 
-        fields = ("panel", "zone", "text", "product_code", "observed_type", "output_group")
+        fields = (
+            "panel",
+            "zone",
+            "text",
+            "product_code",
+            "observed_type",
+            "output_group",
+            "output_group_name",
+            "ringing_style",
+        )
         old_rows = {
             row["stable_key"]: row
             for row in connection.execute(
@@ -619,6 +1135,57 @@ class ProjectRepository:
                             field,
                             _stringify(old_value),
                             _stringify(new_value),
+                        )
+                    )
+        old_output_groups = _configuration_output_group_values(
+            connection, previous_snapshot
+        )
+        new_output_groups = _configuration_output_group_values(
+            connection, snapshot_id
+        )
+        for key in sorted(new_output_groups.keys() - old_output_groups.keys()):
+            changes.append(
+                Change(
+                    "output_group",
+                    key,
+                    "added",
+                    None,
+                    None,
+                    _output_group_change_summary(new_output_groups[key]),
+                )
+            )
+        for key in sorted(old_output_groups.keys() - new_output_groups.keys()):
+            changes.append(
+                Change(
+                    "output_group",
+                    key,
+                    "removed",
+                    None,
+                    _output_group_change_summary(old_output_groups[key]),
+                    None,
+                )
+            )
+        output_group_fields = (
+            "target_node_name",
+            "output_group_name",
+            "zone_triggers",
+            "ringing_styles",
+            "operations",
+            "zone_qualifiers",
+        )
+        for key in sorted(old_output_groups.keys() & new_output_groups.keys()):
+            old_group = old_output_groups[key]
+            new_group = new_output_groups[key]
+            for field in output_group_fields:
+                if old_group[field] != new_group[field]:
+                    changes.append(
+                        Change(
+                            "output_group",
+                            key,
+                            "modified",
+                            field,
+                            _stringify(old_group[field]),
+                            _stringify(new_group[field]),
                         )
                     )
         return changes
@@ -660,13 +1227,12 @@ class ProjectRepository:
                 )
             )
 
-    def fetch_output_groups(self, snapshot_id: int | None = None) -> list[sqlite3.Row]:
+    def fetch_output_groups(self, snapshot_id: int | None = None) -> list[dict]:
         snapshot_id = snapshot_id or self.latest_snapshot_id()
-        if snapshot_id is None:
-            return []
+        groups: dict[tuple[int, int], dict] = {}
         with self.connection() as connection:
-            return list(
-                connection.execute(
+            if snapshot_id is not None:
+                for row in connection.execute(
                     """
                     SELECT node, panel, output_group,
                            MAX(COALESCE(output_group_name, '')) AS group_name,
@@ -680,7 +1246,136 @@ class ProjectRepository:
                     ORDER BY node, output_group
                     """,
                     (snapshot_id,),
+                ):
+                    groups[(int(row["node"]), int(row["output_group"]))] = dict(
+                        row
+                    )
+                for row in connection.execute(
+                    """
+                    SELECT target_node AS node,
+                           MAX(target_node_name) AS panel,
+                           output_group,
+                           MAX(output_group_name) AS group_name,
+                           GROUP_CONCAT(DISTINCT ringing_style_name)
+                               AS ringing_styles
+                    FROM configuration_output_group_lines
+                    WHERE snapshot_id = ?
+                    GROUP BY target_node, output_group
+                    ORDER BY target_node, output_group
+                    """,
+                    (snapshot_id,),
+                ):
+                    key = (int(row["node"]), int(row["output_group"]))
+                    existing = groups.get(key)
+                    if existing is None:
+                        groups[key] = {
+                            **dict(row),
+                            "device_count": 0,
+                        }
+                    else:
+                        if str(row["group_name"] or "").strip():
+                            existing["group_name"] = row["group_name"]
+                        if str(row["ringing_styles"] or "").strip():
+                            existing["ringing_styles"] = row["ringing_styles"]
+            latest_import = connection.execute(
+                "SELECT MAX(id) AS id FROM cause_effect_imports"
+            ).fetchone()["id"]
+            if latest_import is not None:
+                for row in connection.execute(
+                    """
+                    SELECT target_node AS node,
+                           target_node_name AS panel,
+                           output_group,
+                           output_group_name AS group_name
+                    FROM cause_effect_output_groups
+                    WHERE import_id = ?
+                    ORDER BY target_node, output_group
+                    """,
+                    (latest_import,),
+                ):
+                    key = (int(row["node"]), int(row["output_group"]))
+                    existing = groups.get(key)
+                    if existing is None:
+                        groups[key] = {
+                            **dict(row),
+                            "device_count": 0,
+                            "ringing_styles": None,
+                        }
+                    else:
+                        if str(row["panel"] or "").strip():
+                            existing["panel"] = row["panel"]
+                        if str(row["group_name"] or "").strip():
+                            existing["group_name"] = row["group_name"]
+        return [
+            groups[key]
+            for key in sorted(groups)
+        ]
+
+    def fetch_output_group_zone_assignments(
+        self,
+        node: int | None = None,
+        output_group: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = []
+        values: list[int] = []
+        if node is not None:
+            clauses.append("a.node = ?")
+            values.append(int(node))
+        if output_group is not None:
+            clauses.append("a.output_group = ?")
+            values.append(int(output_group))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    f"""
+                    SELECT a.*, z.description
+                    FROM output_group_zone_assignments a
+                    JOIN zones z ON z.number = a.zone
+                    {where}
+                    ORDER BY a.node, a.output_group, a.zone, a.output_kind
+                    """,
+                    values,
                 )
+            )
+
+    def replace_output_group_zone_assignments(
+        self,
+        node: int,
+        output_group: int,
+        assignments: Iterable[tuple[int, str]],
+    ) -> None:
+        normalised = sorted(
+            {
+                (int(zone), str(output_kind).strip().upper())
+                for zone, output_kind in assignments
+            }
+        )
+        invalid = [
+            output_kind
+            for _zone, output_kind in normalised
+            if output_kind not in {"SOUNDER", "BEACON"}
+        ]
+        if invalid:
+            raise ValueError(f"Unsupported output type: {invalid[0]}")
+        with self.connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM output_group_zone_assignments
+                WHERE node = ? AND output_group = ?
+                """,
+                (int(node), int(output_group)),
+            )
+            connection.executemany(
+                """
+                INSERT INTO output_group_zone_assignments(
+                    node, output_group, zone, output_kind
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (int(node), int(output_group), zone, output_kind)
+                    for zone, output_kind in normalised
+                ],
             )
 
     def fetch_output_group_devices(
@@ -707,15 +1402,39 @@ class ProjectRepository:
             return list(
                 connection.execute(
                     """
-                    SELECT z.*, f.name AS floor_name, f.level_order,
-                           COUNT(DISTINCT d.node || '/' || d.loop || '/' || d.address) AS device_count
+                    SELECT z.*,
+                           (
+                               SELECT GROUP_CONCAT(zone_floors.name, ', ')
+                               FROM (
+                                   SELECT f2.name
+                                   FROM zone_geometry g2
+                                   JOIN floors f2 ON f2.id = g2.floor_id
+                                   WHERE g2.zone = z.number
+                                   ORDER BY f2.level_order DESC, f2.name
+                               ) AS zone_floors
+                           ) AS floor_name,
+                           (
+                               SELECT MAX(f2.level_order)
+                               FROM zone_geometry g2
+                               JOIN floors f2 ON f2.id = g2.floor_id
+                               WHERE g2.zone = z.number
+                           ) AS level_order,
+                           COUNT(DISTINCT d.node || '/' || d.loop || '/' || d.address) AS device_count,
+                           (
+                               SELECT GROUP_CONCAT(zone_nodes.node, ', ')
+                               FROM (
+                                   SELECT DISTINCT node
+                                   FROM devices
+                                   WHERE snapshot_id = ? AND zone = z.number
+                                   ORDER BY node
+                               ) AS zone_nodes
+                           ) AS nodes
                     FROM zones z
-                    LEFT JOIN floors f ON f.id = z.floor_id
                     LEFT JOIN devices d ON d.snapshot_id = ? AND d.zone = z.number
                     GROUP BY z.number
                     ORDER BY z.number
                     """,
-                    (snapshot_id,),
+                    (snapshot_id, snapshot_id),
                 )
             )
 
@@ -754,6 +1473,320 @@ class ProjectRepository:
                 )
             return changes
 
+    def fetch_change_details(
+        self,
+        snapshot_id: int | None = None,
+        include_all_imports: bool = False,
+    ) -> list[dict]:
+        field_labels = {
+            "panel": "Panel name",
+            "zone": "Zone",
+            "text": "Device text",
+            "location": "Device text",
+            "location_text": "Device text",
+            "location text": "Device text",
+            "product_code": "Product code",
+            "observed_type": "Device type",
+            "output_group": "Output group",
+            "output_group_name": "Output group name",
+            "ringing_style": "Ringing style",
+            "output_groups": "Output groups",
+            "target_node_name": "Node name",
+            "zone_triggers": "Zone trigger extent",
+            "ringing_styles": "Ringing styles",
+            "operations": "Operations",
+            "zone_qualifiers": "Zone qualifiers",
+        }
+        details = []
+        with self.connection() as connection:
+            if include_all_imports:
+                source_changes = list(
+                    connection.execute(
+                        """
+                        SELECT *
+                        FROM (
+                            SELECT c.id, c.snapshot_id, NULL AS import_id,
+                                   c.entity, c.stable_key, c.change_type,
+                                   c.field, c.old_value, c.new_value,
+                                   s.imported_at AS changed_at,
+                                   s.source_name,
+                                   'Configuration' AS source_kind
+                            FROM changes c
+                            JOIN snapshots s ON s.id = c.snapshot_id
+                            UNION ALL
+                            SELECT c.id, NULL AS snapshot_id, c.import_id,
+                                   c.entity, c.stable_key, c.change_type,
+                                   c.field, c.old_value, c.new_value,
+                                   i.imported_at AS changed_at,
+                                   i.source_name,
+                                   'Cause & Effect' AS source_kind
+                            FROM cause_effect_changes c
+                            JOIN cause_effect_imports i ON i.id = c.import_id
+                        )
+                        ORDER BY changed_at, source_kind, id
+                        """
+                    )
+                )
+            else:
+                source_changes = self.fetch_changes(snapshot_id)
+            for source_change in source_changes:
+                change = dict(source_change)
+                context = None
+                if (
+                    change["entity"] == "device"
+                    and change.get("snapshot_id") is not None
+                ):
+                    snapshot_id = int(change["snapshot_id"])
+                    previous = connection.execute(
+                        "SELECT MAX(id) AS id FROM snapshots WHERE id < ?",
+                        (snapshot_id,),
+                    ).fetchone()["id"]
+                    context = connection.execute(
+                        """
+                        SELECT * FROM devices
+                        WHERE snapshot_id = ? AND stable_key = ?
+                        """,
+                        (snapshot_id, change["stable_key"]),
+                    ).fetchone()
+                    if context is None and previous is not None:
+                        context = connection.execute(
+                            """
+                            SELECT * FROM devices
+                            WHERE snapshot_id = ? AND stable_key = ?
+                            """,
+                            (previous, change["stable_key"]),
+                        ).fetchone()
+                    context = dict(context) if context is not None else None
+                elif (
+                    change["entity"] == "output_group"
+                    and change.get("snapshot_id") is not None
+                ):
+                    snapshot_id = int(change["snapshot_id"])
+                    previous = connection.execute(
+                        "SELECT MAX(id) AS id FROM snapshots WHERE id < ?",
+                        (snapshot_id,),
+                    ).fetchone()["id"]
+                    group_values = _configuration_output_group_values(
+                        connection, snapshot_id
+                    )
+                    context = group_values.get(change["stable_key"])
+                    if context is None and previous is not None:
+                        context = _configuration_output_group_values(
+                            connection, int(previous)
+                        ).get(change["stable_key"])
+                raw_field = str(change.get("field") or "").strip()
+                field = field_labels.get(
+                    raw_field.casefold(),
+                    raw_field.replace("_", " ").title(),
+                )
+                if change["entity"] == "device":
+                    if change["change_type"] == "added":
+                        description = "Device added"
+                    elif change["change_type"] == "removed":
+                        description = "Device removed"
+                    else:
+                        description = f"{field or 'Device'} changed"
+                elif change["entity"].startswith("cause_effect"):
+                    description = (
+                        f"Cause & Effect {field} "
+                        f"{change['change_type']}"
+                    ).strip()
+                elif change["entity"] == "output_group":
+                    if change["change_type"] == "added":
+                        description = "Output group added"
+                    elif change["change_type"] == "removed":
+                        description = "Output group removed"
+                    else:
+                        description = (
+                            f"{field or 'Output group'} changed"
+                        )
+                else:
+                    description = (
+                        f"{str(change['entity']).replace('_', ' ').title()} "
+                        f"{change['change_type']}"
+                    )
+                key_match = re.search(
+                    r"\bnode\s+(\d+)\s*/group\s+(\d+)\b",
+                    str(change.get("stable_key") or ""),
+                    flags=re.IGNORECASE,
+                )
+                node = (
+                    context.get("node")
+                    if context is not None
+                    else int(key_match.group(1)) if key_match else None
+                )
+                output_group = (
+                    context.get("output_group")
+                    if context is not None
+                    else int(key_match.group(2)) if key_match else None
+                )
+                row = {
+                    **change,
+                    "changed_at": change.get("changed_at", ""),
+                    "source_name": change.get("source_name", ""),
+                    "source_kind": change.get("source_kind", ""),
+                    "raw_field": raw_field,
+                    "field": field,
+                    "description": description,
+                    "node": node,
+                    "panel": (
+                        context.get(
+                            "panel",
+                            context.get("target_node_name", ""),
+                        )
+                        if context is not None
+                        else ""
+                    ),
+                    "zone": context.get("zone") if context is not None else None,
+                    "loop": context.get("loop") if context is not None else None,
+                    "address": (
+                        context.get("address") if context is not None else None
+                    ),
+                    "sub_address": (
+                        context.get("sub_address")
+                        if context is not None
+                        else None
+                    ),
+                    "device_text": (
+                        context.get("text", "") if context is not None else ""
+                    ),
+                    "device_type": (
+                        context.get("observed_type", "")
+                        if context is not None
+                        else ""
+                    ),
+                    "output_group": output_group,
+                    "output_group_name": (
+                        context.get("output_group_name", "")
+                        if context is not None
+                        else ""
+                    ),
+                    "ringing_style": (
+                        context.get(
+                            "ringing_style",
+                            context.get("ringing_styles", ""),
+                        )
+                        if context is not None
+                        else ""
+                    ),
+                }
+                details.append(row)
+        return details
+
+    def fetch_project_history(self) -> list[dict]:
+        area_labels = {
+            "metadata": "Project details",
+            "snapshots": "Configuration import",
+            "zones": "Zones",
+            "floors": "Floors",
+            "zone_geometry": "Zone drawings",
+            "ignored_zone_shapes": "Suppressed drawing polygons",
+            "map_assets": "Device placements",
+            "doors": "Doors",
+            "output_groups": "Output groups",
+            "output_group_zone_assignments": "Output-to-zone assignments",
+            "cause_effect_rules": "Cause & Effect rules",
+            "cause_effect_imports": "Cause & Effect imports",
+            "cause_effect_activations": "Cause & Effect activations",
+            "node_power": "Node power settings",
+            "test_sessions": "Test sessions",
+            "test_results": "Test results",
+        }
+        with self.connection() as connection:
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT *
+                    FROM project_audit_log
+                    WHERE NOT (
+                        table_name = 'metadata'
+                        AND COALESCE(
+                            json_extract(new_values_json, '$.key'),
+                            json_extract(old_values_json, '$.key')
+                        ) = 'schema_version'
+                    )
+                    ORDER BY id DESC
+                    """
+                )
+            )
+        history = []
+        for row in rows:
+            old_values = json.loads(row["old_values_json"] or "{}")
+            new_values = json.loads(row["new_values_json"] or "{}")
+            values = new_values or old_values
+            node = None
+            for name in ("node", "target_node", "scope_node"):
+                if values.get(name) not in (None, ""):
+                    try:
+                        node = int(values[name])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if node is None:
+                entity_key = str(values.get("entity_key") or "")
+                match = re.match(r"\s*(\d+)\s*/", entity_key)
+                if match:
+                    node = int(match.group(1))
+            changed_fields = []
+            if row["change_type"] == "modified":
+                changed_fields = [
+                    name
+                    for name in sorted(set(old_values) | set(new_values))
+                    if old_values.get(name) != new_values.get(name)
+                ]
+                summary = "; ".join(
+                    (
+                        f"{name.replace('_', ' ').title()}: "
+                        f"{_stringify(old_values.get(name)) or 'blank'} → "
+                        f"{_stringify(new_values.get(name)) or 'blank'}"
+                    )
+                    for name in changed_fields
+                )
+            else:
+                values = (
+                    new_values
+                    if row["change_type"] == "added"
+                    else old_values
+                )
+                useful = [
+                    name
+                    for name in (
+                        "name",
+                        "number",
+                        "zone",
+                        "floor_id",
+                        "entity_key",
+                        "output_group",
+                        "output_kind",
+                        "action",
+                        "engineer",
+                    )
+                    if name in values and values[name] not in (None, "")
+                ]
+                summary = "; ".join(
+                    f"{name.replace('_', ' ').title()}: {values[name]}"
+                    for name in useful
+                )
+            history.append(
+                {
+                    "id": int(row["id"]),
+                    "changed_at": row["changed_at"],
+                    "table_name": row["table_name"],
+                    "area": area_labels.get(
+                        row["table_name"],
+                        str(row["table_name"]).replace("_", " ").title(),
+                    ),
+                    "change_type": row["change_type"],
+                    "record_key": row["record_key"],
+                    "node": node,
+                    "fields": ", ".join(changed_fields),
+                    "summary": summary or "Record data changed",
+                    "old_values": old_values,
+                    "new_values": new_values,
+                }
+            )
+        return history
+
     def fetch_snapshots(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
             return list(connection.execute("SELECT * FROM snapshots ORDER BY id DESC"))
@@ -777,6 +1810,10 @@ class ProjectRepository:
             )
             if cursor.rowcount == 0:
                 raise ValueError("The selected floor no longer exists.")
+            connection.execute(
+                "DELETE FROM ignored_zone_shapes WHERE floor_id = ?",
+                (int(floor_id),),
+            )
 
     def fetch_floors(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
@@ -792,7 +1829,11 @@ class ProjectRepository:
         geometry_json = json.dumps([[float(x), float(y)] for x, y in points])
         with self.connection() as connection:
             connection.execute(
-                "UPDATE zones SET floor_id = ? WHERE number = ?",
+                """
+                UPDATE zones
+                SET floor_id = COALESCE(floor_id, ?)
+                WHERE number = ?
+                """,
                 (floor_id, zone),
             )
             connection.execute(
@@ -926,6 +1967,21 @@ class ProjectRepository:
                 list(rows),
             )
 
+    def replace_door_suggested_rules(self, rows: Iterable[tuple]) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "DELETE FROM cause_effect_rules WHERE source = 'Door drawing suggestion'"
+            )
+            connection.executemany(
+                """
+                INSERT INTO cause_effect_rules(
+                    name, trigger_zone, relation, target_zone, target_node,
+                    output_group, action, source, enabled, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                list(rows),
+            )
+
     def fetch_rules(self) -> list[sqlite3.Row]:
         with self.connection() as connection:
             return list(
@@ -933,6 +1989,312 @@ class ProjectRepository:
                     "SELECT * FROM cause_effect_rules ORDER BY trigger_zone, action, target_zone, id"
                 )
             )
+
+    def create_door(
+        self,
+        name: str,
+        floor_id: int,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        zone_a: int,
+        zone_b: int,
+        has_access_control: bool,
+        access_device_key: str | None,
+        access_normal_state: str,
+        has_hold_open: bool,
+        hold_open_device_key: str | None,
+        hold_open_normal_state: str,
+        notes: str = "",
+        door_type: str = "SINGLE",
+        sprite_position: tuple[float, float] | None = None,
+        rotation_degrees: float = 0,
+    ) -> int:
+        values = self._validated_door_values(
+            name,
+            floor_id,
+            start,
+            end,
+            zone_a,
+            zone_b,
+            has_access_control,
+            access_device_key,
+            access_normal_state,
+            has_hold_open,
+            hold_open_device_key,
+            hold_open_normal_state,
+            notes,
+            door_type,
+            sprite_position,
+            rotation_degrees,
+        )
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO doors(
+                    name, floor_id, start_x, start_y, end_x, end_y,
+                    zone_a, zone_b, has_access_control, access_device_key,
+                    access_normal_state, has_hold_open, hold_open_device_key,
+                    hold_open_normal_state, notes, door_type, sprite_x,
+                    sprite_y, rotation_degrees
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            return int(cursor.lastrowid)
+
+    def update_door(
+        self,
+        door_id: int,
+        name: str,
+        floor_id: int,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        zone_a: int,
+        zone_b: int,
+        has_access_control: bool,
+        access_device_key: str | None,
+        access_normal_state: str,
+        has_hold_open: bool,
+        hold_open_device_key: str | None,
+        hold_open_normal_state: str,
+        notes: str = "",
+        door_type: str = "SINGLE",
+        sprite_position: tuple[float, float] | None = None,
+        rotation_degrees: float = 0,
+    ) -> None:
+        values = self._validated_door_values(
+            name,
+            floor_id,
+            start,
+            end,
+            zone_a,
+            zone_b,
+            has_access_control,
+            access_device_key,
+            access_normal_state,
+            has_hold_open,
+            hold_open_device_key,
+            hold_open_normal_state,
+            notes,
+            door_type,
+            sprite_position,
+            rotation_degrees,
+        )
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE doors
+                SET name = ?, floor_id = ?,
+                    start_x = ?, start_y = ?, end_x = ?, end_y = ?,
+                    zone_a = ?, zone_b = ?,
+                    has_access_control = ?, access_device_key = ?,
+                    access_normal_state = ?, has_hold_open = ?,
+                    hold_open_device_key = ?, hold_open_normal_state = ?,
+                    notes = ?, door_type = ?, sprite_x = ?, sprite_y = ?,
+                    rotation_degrees = ?
+                WHERE id = ?
+                """,
+                (*values, int(door_id)),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("The selected door no longer exists.")
+
+    def move_door(
+        self,
+        door_id: int,
+        sprite_x: float,
+        sprite_y: float,
+    ) -> None:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE doors
+                SET sprite_x = ?, sprite_y = ?
+                WHERE id = ?
+                """,
+                (float(sprite_x), float(sprite_y), int(door_id)),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("The selected door no longer exists.")
+
+    def _validated_door_values(
+        self,
+        name: str,
+        floor_id: int,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        zone_a: int,
+        zone_b: int,
+        has_access_control: bool,
+        access_device_key: str | None,
+        access_normal_state: str,
+        has_hold_open: bool,
+        hold_open_device_key: str | None,
+        hold_open_normal_state: str,
+        notes: str,
+        door_type: str = "SINGLE",
+        sprite_position: tuple[float, float] | None = None,
+        rotation_degrees: float = 0,
+    ) -> tuple:
+        name = name.strip()
+        access_device_key = (
+            str(access_device_key).strip() if access_device_key else None
+        )
+        hold_open_device_key = (
+            str(hold_open_device_key).strip() if hold_open_device_key else None
+        )
+        access_normal_state = access_normal_state.strip().upper()
+        hold_open_normal_state = hold_open_normal_state.strip().upper()
+        door_type = door_type.strip().upper()
+        if not name:
+            raise ValueError("Enter a door name.")
+        if not has_access_control and not has_hold_open:
+            raise ValueError("Select access control, fire hold-open, or both.")
+        if access_normal_state not in {"LOCKED", "UNLOCKED"}:
+            raise ValueError("Access state must be LOCKED or UNLOCKED.")
+        if hold_open_normal_state not in {"HELD OPEN", "CLOSED"}:
+            raise ValueError("Hold-open state must be HELD OPEN or CLOSED.")
+        if door_type not in {"SINGLE", "DOUBLE"}:
+            raise ValueError("Door type must be SINGLE or DOUBLE.")
+        start_x, start_y = map(float, start)
+        end_x, end_y = map(float, end)
+        if math.hypot(end_x - start_x, end_y - start_y) < 0.001:
+            raise ValueError("Draw the door between two different points.")
+        with self.connection() as connection:
+            floor_exists = connection.execute(
+                "SELECT 1 FROM floors WHERE id = ?", (int(floor_id),)
+            ).fetchone()
+            zones = {
+                int(row["number"])
+                for row in connection.execute(
+                    "SELECT number FROM zones WHERE number IN (?, ?)",
+                    (int(zone_a), int(zone_b)),
+                )
+            }
+            snapshot_id = self.latest_snapshot_id()
+            linked_keys = {
+                key
+                for key in (access_device_key, hold_open_device_key)
+                if key is not None
+            }
+            existing_keys = (
+                {
+                    str(row["stable_key"])
+                    for row in connection.execute(
+                        f"""
+                        SELECT stable_key FROM devices
+                        WHERE snapshot_id = ?
+                          AND stable_key IN ({','.join('?' for _ in linked_keys)})
+                        """,
+                        (snapshot_id, *sorted(linked_keys)),
+                    )
+                }
+                if snapshot_id is not None and linked_keys
+                else set()
+            )
+        if floor_exists is None:
+            raise ValueError("The selected floor no longer exists.")
+        if zones != {int(zone_a), int(zone_b)}:
+            raise ValueError("One or both selected door zones no longer exist.")
+        if linked_keys != existing_keys:
+            raise ValueError("One or both linked fire-alarm devices no longer exist.")
+        if sprite_position is None:
+            sprite_x = (start_x + end_x) / 2.0
+            sprite_y = (start_y + end_y) / 2.0
+        else:
+            sprite_x, sprite_y = map(float, sprite_position)
+        return (
+            name,
+            int(floor_id),
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            int(zone_a),
+            int(zone_b),
+            int(bool(has_access_control)),
+            access_device_key if has_access_control else None,
+            access_normal_state,
+            int(bool(has_hold_open)),
+            hold_open_device_key if has_hold_open else None,
+            hold_open_normal_state,
+            notes.strip(),
+            door_type,
+            sprite_x,
+            sprite_y,
+            float(rotation_degrees),
+        )
+
+    def fetch_doors(self, floor_id: int | None = None) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            if floor_id is None:
+                return list(
+                    connection.execute(
+                        """
+                        SELECT d.*, f.name AS floor_name
+                        FROM doors d
+                        JOIN floors f ON f.id = d.floor_id
+                        ORDER BY f.level_order DESC, d.name, d.id
+                        """
+                    )
+                )
+            return list(
+                connection.execute(
+                    """
+                    SELECT d.*, f.name AS floor_name
+                    FROM doors d
+                    JOIN floors f ON f.id = d.floor_id
+                    WHERE d.floor_id = ?
+                    ORDER BY d.name, d.id
+                    """,
+                    (int(floor_id),),
+                )
+            )
+
+    def delete_door(self, door_id: int) -> None:
+        with self.connection() as connection:
+            connection.execute("DELETE FROM doors WHERE id = ?", (int(door_id),))
+
+    def suggest_door_control_devices(
+        self,
+        zone_a: int,
+        zone_b: int,
+        capability: str,
+    ) -> list[sqlite3.Row]:
+        capability = capability.strip().casefold()
+        keywords = (
+            ("access", "door", "lock", "release", "relay")
+            if capability == "access"
+            else ("hold", "door", "magnet", "release", "relay")
+        )
+
+        def score(row: sqlite3.Row) -> tuple:
+            text = " ".join(
+                str(row[key] or "")
+                for key in ("text", "observed_type", "output_group_name")
+            ).casefold()
+            is_output = (
+                (
+                    row["output_group"] is not None
+                    and int(row["output_group"]) > 0
+                )
+                or "output" in text
+                or "relay" in text
+            )
+            keyword_matches = sum(
+                keyword in text for keyword in keywords
+            )
+            return (
+                int(not is_output),
+                int(int(row["zone"]) not in {int(zone_a), int(zone_b)}),
+                -keyword_matches,
+                int(row["node"]),
+                int(row["loop"]),
+                int(row["address"]),
+                int(row["sub_address"]),
+            )
+
+        return sorted(self.fetch_devices(), key=score)
 
     def update_zone_geometry(
         self,
@@ -974,7 +2336,11 @@ class ProjectRepository:
                 (int(zone), int(geometry_id)),
             )
             connection.execute(
-                "UPDATE zones SET floor_id = ? WHERE number = ?",
+                """
+                UPDATE zones
+                SET floor_id = COALESCE(floor_id, ?)
+                WHERE number = ?
+                """,
                 (int(row["floor_id"]), int(zone)),
             )
             old_zone_remaining = connection.execute(
@@ -1006,14 +2372,63 @@ class ProjectRepository:
                 (int(geometry_id),),
             )
             remaining = connection.execute(
-                "SELECT 1 FROM zone_geometry WHERE zone = ? LIMIT 1",
+                """
+                SELECT floor_id
+                FROM zone_geometry
+                WHERE zone = ?
+                ORDER BY floor_id
+                LIMIT 1
+                """,
                 (int(row["zone"]),),
             ).fetchone()
-            if remaining is None:
-                connection.execute(
-                    "UPDATE zones SET floor_id = NULL WHERE number = ?",
-                    (int(row["zone"]),),
+            connection.execute(
+                "UPDATE zones SET floor_id = ? WHERE number = ?",
+                (
+                    int(remaining["floor_id"]) if remaining is not None else None,
+                    int(row["zone"]),
+                ),
+            )
+
+    def ignore_zone_shape(
+        self,
+        floor_id: int,
+        points: Iterable[tuple[float, float]],
+        source_layer: str = "",
+        shape_key: str | None = None,
+    ) -> None:
+        point_list = [
+            (float(x), float(y))
+            for x, y in points
+        ]
+        key = shape_key or zone_shape_key(point_list)
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO ignored_zone_shapes(
+                    floor_id, shape_key, geometry_json, source_layer
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    int(floor_id),
+                    key,
+                    json.dumps([[x, y] for x, y in point_list]),
+                    str(source_layer or ""),
+                ),
+            )
+
+    def fetch_ignored_zone_shape_keys(self, floor_id: int) -> set[str]:
+        with self.connection() as connection:
+            return {
+                str(row["shape_key"])
+                for row in connection.execute(
+                    """
+                    SELECT shape_key
+                    FROM ignored_zone_shapes
+                    WHERE floor_id = ?
+                    """,
+                    (int(floor_id),),
                 )
+            }
 
     def import_cause_effect(
         self, workbook_path: str | Path
@@ -1413,10 +2828,13 @@ class ProjectRepository:
         self,
         trigger_zone: object | None = None,
         scope_node: int | None = None,
-    ) -> list[sqlite3.Row]:
+    ) -> list:
         latest = self.latest_cause_effect_import()
         if latest is None:
-            return []
+            return self._fetch_configuration_activations(
+                trigger_zone,
+                scope_node,
+            )
         clauses = ["import_id = ?"]
         parameters: list[object] = [latest["id"]]
         if trigger_zone is not None:
@@ -1441,6 +2859,81 @@ class ProjectRepository:
                     parameters,
                 )
             )
+
+    def fetch_configuration_output_group_lines(
+        self,
+        scope_node: int | None = None,
+    ) -> list[sqlite3.Row]:
+        snapshot_id = self.latest_snapshot_id()
+        if snapshot_id is None:
+            return []
+        clauses = ["snapshot_id = ?"]
+        parameters: list[object] = [snapshot_id]
+        if scope_node is not None:
+            clauses.append("target_node = ?")
+            parameters.append(int(scope_node))
+        with self.connection() as connection:
+            return list(
+                connection.execute(
+                    f"""
+                    SELECT *
+                    FROM configuration_output_group_lines
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY target_node, output_group, source_row
+                    """,
+                    parameters,
+                )
+            )
+
+    def _fetch_configuration_activations(
+        self,
+        trigger_zone: object | None,
+        scope_node: int | None,
+    ) -> list[dict]:
+        if trigger_zone is None:
+            return []
+        normalised = normalise_zone_key(trigger_zone)
+        try:
+            numeric_zone = float(normalised)
+        except ValueError:
+            return []
+        if not numeric_zone.is_integer() or numeric_zone <= 0:
+            return []
+        zone = int(numeric_zone)
+        activations = []
+        for line in self.fetch_configuration_output_group_lines(scope_node):
+            if (
+                int(line["operation"]) != 0
+                or zone < int(line["zone_from"])
+                or zone > int(line["zone_to"])
+            ):
+                continue
+            activations.append(
+                {
+                    "id": (
+                        f"skf/{line['source_row']}/"
+                        f"{line['target_node']}/{line['output_group']}"
+                    ),
+                    "trigger_zone": str(zone),
+                    "trigger_zone_name": "",
+                    "target_node": int(line["target_node"]),
+                    "target_node_name": str(line["target_node_name"] or ""),
+                    "output_group": int(line["output_group"]),
+                    "output_group_name": str(
+                        line["output_group_name"] or ""
+                    ),
+                    "output_zone_name": "",
+                    "ringing_style": str(line["ringing_style"] or "Triggered"),
+                    "ringing_style_name": str(
+                        line["ringing_style_name"] or ""
+                    ),
+                    "zone_qualifiers": int(line["zone_qualifiers"]),
+                    "source_row": int(line["source_row"]),
+                    "comments": "",
+                    "reference_status": "configuration",
+                }
+            )
+        return activations
 
     def fetch_cause_effect_trigger_zones(self) -> list[sqlite3.Row]:
         latest = self.latest_cause_effect_import()
@@ -1531,6 +3024,99 @@ class ProjectRepository:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def fetch_rule(self, rule_id: int) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM cause_effect_rules WHERE id = ?",
+                (int(rule_id),),
+            ).fetchone()
+
+    def update_custom_rule(
+        self,
+        rule_id: int,
+        name: str,
+        trigger_zone: int,
+        relation: str,
+        target_zone: int | None,
+        target_node: int | None,
+        output_group: int | None,
+        action: str,
+        notes: str = "",
+    ) -> None:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE cause_effect_rules
+                SET name = ?, trigger_zone = ?, relation = ?,
+                    target_zone = ?, target_node = ?, output_group = ?,
+                    action = ?, notes = ?
+                WHERE id = ? AND source = 'custom'
+                """,
+                (
+                    name,
+                    trigger_zone,
+                    relation,
+                    target_zone,
+                    target_node,
+                    output_group,
+                    action,
+                    notes,
+                    int(rule_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "Only custom cause-and-effect rules can be edited."
+                )
+
+    def delete_custom_rule(self, rule_id: int) -> None:
+        self.delete_custom_rules([rule_id])
+
+    def delete_custom_rules(self, rule_ids: Iterable[int]) -> None:
+        ids = sorted({int(rule_id) for rule_id in rule_ids})
+        if not ids:
+            return
+        with self.connection() as connection:
+            placeholders = ", ".join("?" for _rule_id in ids)
+            custom_count = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM cause_effect_rules
+                WHERE id IN ({placeholders}) AND source = 'custom'
+                """,
+                ids,
+            ).fetchone()[0]
+            if int(custom_count) != len(ids):
+                raise ValueError(
+                    "Only custom cause-and-effect rules can be removed "
+                    "through this method."
+                )
+        self.delete_rules(ids)
+
+    def delete_rules(self, rule_ids: Iterable[int]) -> None:
+        ids = sorted({int(rule_id) for rule_id in rule_ids})
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _rule_id in ids)
+        with self.connection() as connection:
+            existing_count = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM cause_effect_rules
+                WHERE id IN ({placeholders})
+                """,
+                ids,
+            ).fetchone()[0]
+            if int(existing_count) != len(ids):
+                raise ValueError("One or more selected rules no longer exist.")
+            connection.execute(
+                f"""
+                DELETE FROM cause_effect_rules
+                WHERE id IN ({placeholders})
+                """,
+                ids,
+            )
 
     def set_node_power(
         self,
@@ -1691,6 +3277,94 @@ class ProjectRepository:
                     (int(session_id),),
                 )
             )
+
+
+def _configuration_output_group_values(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+) -> dict[str, dict]:
+    grouped: dict[tuple[int, int], list[sqlite3.Row]] = {}
+    for row in connection.execute(
+        """
+        SELECT *
+        FROM configuration_output_group_lines
+        WHERE snapshot_id = ?
+        ORDER BY target_node, output_group, source_row
+        """,
+        (snapshot_id,),
+    ):
+        grouped.setdefault(
+            (int(row["target_node"]), int(row["output_group"])),
+            [],
+        ).append(row)
+    values: dict[str, dict] = {}
+    for (node, output_group), rows in grouped.items():
+        def combined(field: str) -> str:
+            return " / ".join(
+                dict.fromkeys(
+                    str(row[field] or "").strip()
+                    for row in rows
+                    if str(row[field] or "").strip()
+                )
+            )
+
+        zone_triggers = "; ".join(
+            dict.fromkeys(
+                (
+                    f"{int(row['zone_from'])}"
+                    if int(row["zone_from"]) == int(row["zone_to"])
+                    else (
+                        f"{int(row['zone_from'])}-"
+                        f"{int(row['zone_to'])}"
+                    )
+                )
+                for row in rows
+            )
+        )
+        ringing_styles = "; ".join(
+            dict.fromkeys(
+                " ".join(
+                    part
+                    for part in (
+                        f"Style {int(row['output_style_number'])}",
+                        str(row["ringing_style"] or "").strip(),
+                        str(row["ringing_style_name"] or "").strip(),
+                    )
+                    if part
+                )
+                for row in rows
+            )
+        )
+        operations = "; ".join(
+            dict.fromkeys(str(int(row["operation"])) for row in rows)
+        )
+        qualifiers = "; ".join(
+            dict.fromkeys(
+                str(int(row["zone_qualifiers"])) for row in rows
+            )
+        )
+        key = f"node {node}/group {output_group}"
+        values[key] = {
+            "node": node,
+            "target_node_name": combined("target_node_name"),
+            "output_group": output_group,
+            "output_group_name": combined("output_group_name"),
+            "zone_triggers": zone_triggers,
+            "ringing_styles": ringing_styles,
+            "operations": operations,
+            "zone_qualifiers": qualifiers,
+        }
+    return values
+
+
+def _output_group_change_summary(group: dict) -> str:
+    name = str(group.get("output_group_name") or "").strip()
+    return (
+        f"Group {group['output_group']}"
+        f"{' - ' + name if name else ''}; "
+        f"zones {group['zone_triggers']}; "
+        f"{group['ringing_styles']}"
+    )
 
 
 def _now() -> str:

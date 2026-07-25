@@ -11,6 +11,7 @@ from .project import ProjectRepository
 
 
 HTM_SOURCE = "HTM 05-03 Figure 2"
+DOOR_SOURCE = "Door drawing suggestion"
 
 
 @dataclass(slots=True)
@@ -110,6 +111,70 @@ def generate_htm_rules(
                 )
             )
     repository.replace_suggested_rules(rows)
+    return len(rows)
+
+
+def generate_door_rules(repository: ProjectRepository) -> int:
+    devices = {
+        str(row["stable_key"]): row
+        for row in repository.fetch_devices()
+    }
+    rows: list[tuple] = []
+    for door in repository.fetch_doors():
+        zone_a = int(door["zone_a"])
+        zone_b = int(door["zone_b"])
+        zone_context = (
+            f"within zone {zone_a}"
+            if zone_a == zone_b
+            else f"between zones {zone_a} and {zone_b}"
+        )
+        for capability, device_key, action in (
+            (
+                "access release",
+                door["access_device_key"],
+                "UNLOCK DOOR",
+            ),
+            (
+                "hold-open release",
+                door["hold_open_device_key"],
+                "CLOSE FIRE DOOR",
+            ),
+        ):
+            enabled = (
+                door["has_access_control"]
+                if capability == "access release"
+                else door["has_hold_open"]
+            )
+            if not enabled:
+                continue
+            device = devices.get(str(device_key))
+            if (
+                device is None
+                or device["output_group"] is None
+                or int(device["output_group"]) <= 0
+            ):
+                continue
+            for trigger_zone in sorted(
+                {int(door["zone_a"]), int(door["zone_b"])}
+            ):
+                rows.append(
+                    (
+                        f"{door['name']} — {capability}",
+                        trigger_zone,
+                        "door side",
+                        None,
+                        int(device["node"]),
+                        int(device["output_group"]),
+                        action,
+                        DOOR_SOURCE,
+                        1,
+                        (
+                            f"Suggested from door drawing {zone_context}; verify "
+                            "against the approved fire strategy."
+                        ),
+                    )
+                )
+    repository.replace_door_suggested_rules(rows)
     return len(rows)
 
 

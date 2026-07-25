@@ -19,6 +19,14 @@ def test_project_import_and_duplicate_detection(tmp_path: Path) -> None:
     assert len(repository.fetch_zones()) > 0
     zone_179 = next(row for row in repository.fetch_zones() if row["number"] == 179)
     assert zone_179["description"] == "PATH LAB FIRST FLOOR"
+    assert zone_179["nodes"]
+    assert [int(node) for node in zone_179["nodes"].split(", ")] == sorted(
+        {
+            row["node"]
+            for row in repository.fetch_devices()
+            if row["zone"] == 179
+        }
+    )
     node_52_groups = [
         row for row in repository.fetch_output_groups() if row["node"] == 52
     ]

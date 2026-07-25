@@ -68,3 +68,44 @@ def test_dxf_linework_and_closed_zone_shapes(tmp_path: Path) -> None:
         "ZONES",
         "ZONES_UNFLAGGED",
     ]
+
+
+def test_dxf_text_uses_effective_rotation_and_text_style(tmp_path: Path) -> None:
+    path = tmp_path / "styled-text.dxf"
+    document = ezdxf.new()
+    style = document.styles.add(
+        "ARCHITECTURAL",
+        font="missing-architectural-font.shx",
+        dxfattribs={
+            "width": 0.8,
+            "oblique": 12,
+        },
+    )
+    style.set_extended_font_data(
+        "Unavailable Architectural Font",
+        italic=True,
+        bold=True,
+    )
+    label = document.modelspace().add_mtext(
+        "Rotated room",
+        dxfattribs={
+            "layer": "LABELS",
+            "style": "ARCHITECTURAL",
+            "char_height": 4,
+        },
+    )
+    label.dxf.insert = (25, 40)
+    label.dxf.text_direction = (0, 1, 0)
+    document.saveas(path)
+
+    parsed = read_text(path)
+
+    assert len(parsed) == 1
+    assert parsed[0].rotation == 90
+    assert parsed[0].style_name == "ARCHITECTURAL"
+    assert parsed[0].font_family == "Unavailable Architectural Font"
+    assert parsed[0].font_file == "missing-architectural-font.shx"
+    assert parsed[0].bold
+    assert parsed[0].italic
+    assert parsed[0].width_factor == 0.8
+    assert parsed[0].oblique == 12

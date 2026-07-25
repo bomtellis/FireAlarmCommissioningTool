@@ -14,6 +14,7 @@ from firepanel.ncf import (
     parse_ncf,
     read_configuration_cause_effect,
 )
+from firepanel.project import ProjectRepository
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,7 +172,12 @@ def test_skf_json_tables_are_parsed_without_changing_legacy_api(tmp_path: Path) 
                     "NetworkAddress": 52,
                     "GroupNo": 50,
                     "GroupText": "PATHOLOGY ACCESS DOORS",
-                }
+                },
+                {
+                    "NetworkAddress": 52,
+                    "GroupNo": 51,
+                    "GroupText": "PANEL SOUNDERS",
+                },
             ],
         )
         _write_skf_table(
@@ -186,7 +192,16 @@ def test_skf_json_tables_are_parsed_without_changing_legacy_api(tmp_path: Path) 
                     "ZoneFrom": 179,
                     "ZoneTo": 179,
                     "ZoneQualifiers": 2049,
-                }
+                },
+                {
+                    "NetworkAddress": 52,
+                    "GroupNo": 51,
+                    "Operation": 0,
+                    "OutputStyleNo": 1,
+                    "ZoneFrom": 178,
+                    "ZoneTo": 179,
+                    "ZoneQualifiers": 1024,
+                },
             ],
         )
         _write_skf_table(
@@ -197,7 +212,12 @@ def test_skf_json_tables_are_parsed_without_changing_legacy_api(tmp_path: Path) 
                     "NetworkAddress": 52,
                     "StyleNumber": 0,
                     "Description": "Evacuate",
-                }
+                },
+                {
+                    "NetworkAddress": 52,
+                    "StyleNumber": 1,
+                    "Description": "Alert",
+                },
             ],
         )
 
@@ -226,17 +246,87 @@ def test_skf_json_tables_are_parsed_without_changing_legacy_api(tmp_path: Path) 
 
     zone_179 = next(zone for zone in parsed.zones if zone.number == 179)
     assert zone_179.description == "PATH LAB FIRST FLOOR"
+    assert [
+        (
+            line.output_group,
+            line.zone_from,
+            line.zone_to,
+            line.ringing_style,
+            line.ringing_style_name,
+            line.zone_qualifiers,
+        )
+        for line in parsed.output_group_lines
+    ] == [
+        (50, 179, 179, "E", "Evacuate", 2049),
+        (51, 178, 179, "A", "Alert", 1024),
+    ]
 
     cause_effect = read_configuration_cause_effect(path, [178, 179])
     assert [(row.target_node, row.output_group) for row in cause_effect.output_groups] == [
-        (52, 50)
+        (52, 50),
+        (52, 51),
     ]
-    assert len(cause_effect.activations) == 1
-    activation = cause_effect.activations[0]
+    assert len(cause_effect.activations) == 3
+    activation = next(
+        row
+        for row in cause_effect.activations
+        if row.output_group == 50
+    )
     assert activation.trigger_zone == "179"
     assert activation.ringing_style == "E"
     assert activation.ringing_style_name == "Evacuate"
     assert activation.zone_qualifiers == 2049
+    assert {
+        (row.trigger_zone, row.output_group, row.ringing_style)
+        for row in cause_effect.activations
+    } == {
+        ("178", 51, "A"),
+        ("179", 50, "E"),
+        ("179", 51, "A"),
+    }
+
+    repository = ProjectRepository.create(
+        tmp_path / "skf-project.fcp",
+        "SKF project",
+        path,
+    )
+    persisted_lines = repository.fetch_configuration_output_group_lines()
+    assert [
+        (
+            row["output_group"],
+            row["zone_from"],
+            row["zone_to"],
+            row["ringing_style"],
+        )
+        for row in persisted_lines
+    ] == [
+        (50, 179, 179, "E"),
+        (51, 178, 179, "A"),
+    ]
+    assert {
+        (
+            row["trigger_zone"],
+            row["output_group"],
+            row["ringing_style"],
+        )
+        for row in repository.fetch_cause_effect_activations(178)
+    } == {("178", 51, "A")}
+    panel_group = next(
+        row
+        for row in repository.fetch_output_groups()
+        if row["node"] == 52 and row["output_group"] == 51
+    )
+    assert panel_group["device_count"] == 0
+    assert panel_group["group_name"] == "PANEL SOUNDERS"
+    repository.replace_output_group_zone_assignments(
+        52,
+        51,
+        [(178, "SOUNDER"), (179, "BEACON")],
+    )
+    assert [
+        (row["zone"], row["output_kind"])
+        for row in repository.fetch_output_group_zone_assignments(52, 51)
+    ] == [(178, "SOUNDER"), (179, "BEACON")]
 
 
 def test_supplied_ncf_inventory() -> None:

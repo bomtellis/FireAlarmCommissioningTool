@@ -11,34 +11,117 @@ The application is licensed under the GNU Affero General Public License v3.0.
 
 - Create a project from an NCF or SKF file and retain immutable configuration snapshots.
 - Import an updated NCF or SKF and identify added, removed and modified point records.
-- Export a signed-review-style tracked changes PDF.
+- Preserve every SKF output-group line with its node/group assignment,
+  `ZoneFrom`/`ZoneTo` trigger extent, operation, qualifiers, and resolved
+  ringing-style number, name, and code. Panel-only outputs can therefore drive
+  Test mode without an addressable loop device.
+- Export a signed-review-style tracked changes PDF containing the complete
+  project history and configuration/Cause & Effect differences from every
+  selected revision, with an export-time revision picker, overall totals, page
+  numbering, and device/output-group changes grouped first by revision and
+  then under titled node sections.
+- Show configuration changes with full node, zone, loop, address, sub-address,
+  device text, device type, output group, and ringing-style context. The SKF
+  `Location` field is presented consistently as `Device text`. Maintain a
+  separate append-only Project History journal for ongoing drawing, placement,
+  door, rule, output assignment, settings, import, and testing changes.
+- Track SKF output-group additions, removals, names, node names, ringing
+  styles, operations, zone-trigger extents, and qualifiers between revisions,
+  and include them under the relevant node in the changes view and PDF.
 - Browse naturally sorted nodes, loops, addresses, sub-addresses, zones and observed device types.
-- Review zone numbers, descriptions and physical device counts in a dedicated Zones view.
+- View the installed application version, purpose, and licence on the About
+  page in the main navigation.
+- Use complete, action-specific icons throughout the Project and Commission
+  ribbons, with a widened File menu that keeps action names and shortcuts
+  clearly separated.
+- Review zone numbers, descriptions, physical device counts and the nodes using
+  each zone in a dedicated Zones view.
 - Filter every table by right-clicking any column heading.
 - Calculate separate quiescent and alarm current totals per node and estimate
   battery autonomy using editable project assumptions.
-- Import closed DXF polylines, create floors and assign shapes to zones.
-- Render the DXF as a persistent floor-plan underlay and place imported
+- Manage a separate architectural DXF underlay for every floor through one
+  drawing-management dialog, and assign closed DXF polylines to zones.
+- Render DXF geometry and text natively at full resolution, honour text
+  rotation and available DXF fonts with installed-system fallbacks, preserve
+  the current x/y view and zoom while changing floors, pan freely beyond the
+  DXF extents, and middle-pan while drawing without cancelling the current
+  polygon. Toggle the complete
+  architectural underlay independently of commissioning overlays, and place imported
   detectors, call points, sounders, output devices, power supplies and panels
   directly on it.
-- Display DXF text, toggle drawing layers, and create or edit zone polygons by
-  moving, rotating, realigning, reassigning or unassigning them.
+- Toggle individual DXF layers; Ctrl-click to select multiple polygons; and
+  use the polygon right-click menu to drag-edit points, assign/remove zones,
+  copy selected zone polygons to the floor above, transform, or delete them.
+  Deleted DXF-derived polygons remain suppressed until the floor underlay is
+  replaced.
+- Assign one zone across multiple floors while retaining a single polygon for
+  that zone on each floor.
+- Place rotatable single- or double-door sprites between two zones, configure
+  access release and/or fire hold-open functions, link each function to a
+  fire-alarm device immediately or later, and generate suggested output rules
+  from the linked output groups. Doors wholly within one zone can record that
+  same zone on both sides. Door sprites use fixed floor-plan dimensions
+  and scale with the DXF as the view zooms. Control-device selectors provide
+  contains-style typeahead, while architectural swing arcs and red/green
+  padlocks show open/closed and locked/unlocked states. Placement preselects
+  the two nearest zone polygons on the current floor for review.
 - Select a placed symbol to inspect its node, zone, loop, address, sub-address
   and any decoded output-group relationships.
+- Place devices zone-by-zone from an automatic queue: each drawing click
+  positions the displayed current device, advances to the next unplaced
+  device, and preserves the current drawing position and zoom.
+- Represent every physical device once in the zone view, combining all of its
+  sub-addresses into that marker, and drag a placed marker to save a revised
+  position without selecting the zone polygon underneath.
+- Select the floor shown in test mode and render its native architectural DXF
+  beneath only that floor's zone polygons, doors and placed devices.
+- Drag a complete door sprite, including its attached state icon, to save a
+  revised position; test mode shows every door on the selected floor.
+- Search the test-mode fire-zone selector by zone number or any part of its
+  description using case-insensitive typeahead.
+- Highlight placed devices whose node/output group is activated by the current
+  fire simulation, retain the map zoom and centre while redrawing, and show a
+  device status popup with its name and full address when clicked.
+- Assign activated sounder and beacon output groups to the zones containing
+  their configured devices. Test mode includes those zones, outlines them, and
+  shows the ringing style in the zone tooltip, popup, and results table;
+  evacuate sounders colour the zone red and alert sounders colour it yellow.
+- Merge panel-only output groups from imported Cause & Effect/SKF data into the
+  Output Groups view and explicitly assign each group to the sounder and/or
+  beacon zones it serves. Beacon/VAD points retain a separate beacon symbol
+  even when the panel configuration reports their generic type as `Sounder`.
+- Show the same larger, fixed-screen device information card in the zone
+  drawing view. The card keeps a readable minimum size while zooming out and
+  grows with the background while zooming in; grouped devices list the
+  configured name of every sub-address.
+- Use conventional red-outline fire-alarm plan symbols, including an `O`
+  optical detector and rectangular `I/O` interface, with scene-sized linework
+  and labels that zoom at the same rate as the architectural underlay.
 - Suggest same-floor and directly-above/below alert zones from drawing geometry.
 - Add custom rules for doors straddling zones, output groups, HVAC, lifts and
-  other ancillary interfaces.
+  other ancillary interfaces, then explicitly edit a selected custom rule or
+  Ctrl/Shift-select and remove any combination of custom, HTM, or door-control
+  rules after confirmation.
 - Import a Cause & Effect `.xlsx` matrix as zone-triggered output-group
   activations while preserving its ringing-style codes.
 - Check matrix-derived activations against the workbook's `OutputGroupInfo`
   sheet, expose both directions of mismatch, and retain filterable engineer
   comments.
 - Simulate a fire by zone for the whole site or an individual panel.
+- Show door access as locked/unlocked and hold-open as open/closed, with
+  explicit unlock and close checks in test mode.
+- During a fire simulation, change each door function independently when its
+  linked output device activates: access releases unlock and hold-open releases
+  close the door.
 - Visualise normal zones in green, the origin/evacuate zone in red and
   adjacent/alert zones in yellow.
 - Export the device schedule to an Excel commissioning workbook.
-- Export selected or all fire-call zones to an output-group testing workbook,
-  with controlled result fields that can be imported back into test sessions.
+- Choose fire-call zones for an output-group testing workbook with a searchable
+  available-zones list and explicit left/right transfer controls, then import
+  the workbook's controlled result fields back into test sessions.
+- Include a filterable Zone List worksheet in every output-group testing
+  workbook, showing zone names, nodes, floors, device counts, and highlighting
+  the zones selected for that testing export.
 - Export configuration/imported Cause & Effect matrices and their differences
   as separate sheets in one comparison workbook.
 

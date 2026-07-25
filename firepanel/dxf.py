@@ -65,6 +65,7 @@ class DxfShape:
     layer: str
     entity_type: str
     points: list[tuple[float, float]]
+    source_key: str = ""
 
 
 @dataclass(slots=True)
@@ -83,6 +84,47 @@ class DxfText:
     y: float
     height: float
     rotation: float
+    style_name: str = "Standard"
+    font_family: str = ""
+    font_file: str = ""
+    bold: bool = False
+    italic: bool = False
+    width_factor: float = 1.0
+    oblique: float = 0.0
+
+
+def _text_style(document, entity) -> tuple[str, str, str, bool, bool, float, float]:
+    style_name = str(entity.dxf.get("style", "Standard") or "Standard")
+    font_family = ""
+    font_file = ""
+    bold = False
+    italic = False
+    width_factor = 1.0
+    oblique = 0.0
+    try:
+        style = document.styles.get(style_name)
+    except Exception:
+        style = None
+    if style is not None:
+        font_file = str(style.dxf.get("font", "") or "")
+        width_factor = float(style.dxf.get("width", 1.0) or 1.0)
+        oblique = float(style.dxf.get("oblique", 0.0) or 0.0)
+        try:
+            font_family, italic, bold = style.get_extended_font_data()
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if entity.dxftype() == "TEXT":
+        width_factor *= float(entity.dxf.get("width", 1.0) or 1.0)
+        oblique = float(entity.dxf.get("oblique", oblique) or oblique)
+    return (
+        style_name,
+        str(font_family or ""),
+        font_file,
+        bool(bold),
+        bool(italic),
+        max(width_factor, 0.01),
+        oblique,
+    )
 
 
 def read_text(path: str | Path) -> list[DxfText]:
@@ -98,11 +140,22 @@ def read_text(path: str | Path) -> list[DxfText]:
             if entity_type == "MTEXT":
                 text = entity.plain_text()
                 height = float(entity.dxf.char_height or 2.5)
+                rotation = float(entity.get_rotation())
             else:
                 text = str(entity.dxf.text or "")
                 height = float(entity.dxf.height or 2.5)
+                rotation = float(entity.dxf.rotation or 0.0)
             if not text.strip():
                 continue
+            (
+                style_name,
+                font_family,
+                font_file,
+                bold,
+                italic,
+                width_factor,
+                oblique,
+            ) = _text_style(document, entity)
             result.append(
                 DxfText(
                     layer=str(entity.dxf.layer),
@@ -110,7 +163,14 @@ def read_text(path: str | Path) -> list[DxfText]:
                     x=float(insert.x),
                     y=float(insert.y),
                     height=max(height, 0.01),
-                    rotation=float(entity.dxf.rotation or 0.0),
+                    rotation=rotation,
+                    style_name=style_name,
+                    font_family=font_family,
+                    font_file=font_file,
+                    bold=bold,
+                    italic=italic,
+                    width_factor=width_factor,
+                    oblique=oblique,
                 )
             )
     return result

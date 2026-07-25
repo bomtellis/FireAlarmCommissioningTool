@@ -4,15 +4,395 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook, load_workbook
 
 from firepanel.cause_effect import read_cause_effect_workbook
-from firepanel.project import ProjectRepository
+from firepanel.project import ProjectRepository, zone_shape_key
+from firepanel.rules import generate_door_rules
 from firepanel.testing_workbook import (
     RESULT_HEADERS,
+    ZONE_HEADERS,
     export_testing_workbook,
     read_testing_workbook,
 )
+
+
+def test_custom_rules_can_be_updated_and_removed_but_suggestions_cannot(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "custom-rules.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+    with repository.connection() as connection:
+        connection.executemany(
+            "INSERT INTO zones(number, description) VALUES (?, ?)",
+            [(10, "Ward"), (11, "Corridor")],
+        )
+
+    rule_id = repository.add_rule(
+        "Original rule",
+        10,
+        "exact",
+        11,
+        None,
+        20,
+        "ACTIVATE OUTPUT",
+        "Original notes",
+    )
+    repository.update_custom_rule(
+        rule_id,
+        "Updated rule",
+        11,
+        "adjacent",
+        10,
+        2,
+        30,
+        "ALERT / intermittent",
+        "Updated notes",
+    )
+
+    updated = repository.fetch_rule(rule_id)
+    assert updated["name"] == "Updated rule"
+    assert updated["trigger_zone"] == 11
+    assert updated["relation"] == "adjacent"
+    assert updated["target_zone"] == 10
+    assert updated["target_node"] == 2
+    assert updated["output_group"] == 30
+    assert updated["action"] == "ALERT / intermittent"
+    assert updated["notes"] == "Updated notes"
+
+    with repository.connection() as connection:
+        connection.execute(
+            "UPDATE cause_effect_rules SET source = ? WHERE id = ?",
+            ("HTM 05-03 Figure 2", rule_id),
+        )
+    with pytest.raises(ValueError, match="Only custom"):
+        repository.update_custom_rule(
+            rule_id,
+            "Blocked",
+            10,
+            "exact",
+            11,
+            None,
+            None,
+            "ALERT / intermittent",
+        )
+    with pytest.raises(ValueError, match="Only custom"):
+        repository.delete_custom_rule(rule_id)
+    other_id = repository.add_rule(
+        "Second custom rule",
+        10,
+        "exact",
+        11,
+        None,
+        None,
+        "ALERT / intermittent",
+    )
+    with pytest.raises(ValueError, match="Only custom"):
+        repository.delete_custom_rules([rule_id, other_id])
+    assert repository.fetch_rule(other_id) is not None
+
+    repository.delete_rules([rule_id, other_id])
+    assert repository.fetch_rule(rule_id) is None
+    assert repository.fetch_rule(other_id) is None
+
+
+def test_project_history_keeps_an_append_only_log_of_project_edits(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "project-history.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+
+    repository.set_metadata("project_name", "History test")
+    floor_id = repository.add_floor("Ground", 0)
+    with repository.connection() as connection:
+        connection.execute(
+            "INSERT INTO zones(number, description) VALUES (10, 'Ward')"
+        )
+    repository.assign_zone_geometry(
+        10,
+        floor_id,
+        [(0, 0), (10, 0), (10, 10), (0, 0)],
+        "USER_DRAWN",
+    )
+    geometry_id = repository.fetch_zone_geometry()[0]["id"]
+    repository.update_zone_geometry(
+        geometry_id,
+        [(2, 2), (12, 2), (12, 12), (2, 2)],
+    )
+    history_before_delete = repository.fetch_project_history()
+    repository.remove_zone_geometry(geometry_id)
+    history = repository.fetch_project_history()
+
+    assert len(history) >= len(history_before_delete) + 1
+    assert any(
+        row["area"] == "Zone drawings"
+        and row["change_type"] == "removed"
+        for row in history
+    )
+    assert any(
+        row["area"] == "Zone drawings"
+        and row["change_type"] == "modified"
+        and "Geometry Json" in row["summary"]
+        for row in history
+    )
+    assert any(
+        row["area"] == "Project details"
+        and row["change_type"] == "added"
+        for row in history
+    )
+    history_count = len(history)
+    reopened = ProjectRepository(project_path)
+    assert len(reopened.fetch_project_history()) == history_count
+
+
+def test_configuration_change_details_include_full_device_context(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "change-details.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+    with repository.connection() as connection:
+        old_snapshot = connection.execute(
+            """
+            INSERT INTO snapshots(
+                imported_at, source_name, source_path, sha256,
+                versions_json, warnings_json
+            ) VALUES ('old', 'old.skf', 'old.skf', 'old', '[]', '[]')
+            """
+        ).lastrowid
+        new_snapshot = connection.execute(
+            """
+            INSERT INTO snapshots(
+                imported_at, source_name, source_path, sha256,
+                versions_json, warnings_json
+            ) VALUES ('new', 'new.skf', 'new.skf', 'new', '[]', '[]')
+            """
+        ).lastrowid
+        for snapshot_id, zone in (
+            (old_snapshot, 10),
+            (new_snapshot, 11),
+        ):
+            connection.execute(
+                """
+                INSERT INTO devices(
+                    snapshot_id, stable_key, node, panel, loop, address,
+                    sub_address, zone, text, product_code, observed_type,
+                    output_group, output_group_name, ringing_style,
+                    record_offset
+                ) VALUES (
+                    ?, '7/2/15/3', 7, 'Panel 7', 2, 15, 3, ?,
+                    'Ward beacon', 27, 'Visual Alarm Device',
+                    4, 'Ward beacons', 'Alert', 100
+                )
+                """,
+                (snapshot_id, zone),
+            )
+        connection.execute(
+            """
+            INSERT INTO changes(
+                snapshot_id, entity, stable_key, change_type,
+                field, old_value, new_value
+            ) VALUES (?, 'device', '7/2/15/3', 'modified', 'zone', '10', '11')
+            """,
+            (new_snapshot,),
+        )
+        connection.execute(
+            """
+            INSERT INTO changes(
+                snapshot_id, entity, stable_key, change_type,
+                field, old_value, new_value
+            ) VALUES (
+                ?, 'device', '7/2/15/3', 'added',
+                NULL, NULL, 'Initial device'
+            )
+            """,
+            (old_snapshot,),
+        )
+        connection.execute(
+            """
+            INSERT INTO changes(
+                snapshot_id, entity, stable_key, change_type,
+                field, old_value, new_value
+            ) VALUES (
+                ?, 'device', '7/2/15/3', 'modified',
+                'Location text', 'Old ward beacon', 'Ward beacon'
+            )
+            """,
+            (new_snapshot,),
+        )
+
+    detail = next(
+        row
+        for row in repository.fetch_change_details()
+        if row["entity"] == "device"
+    )
+    assert detail["description"] == "Zone changed"
+    assert (
+        detail["node"],
+        detail["zone"],
+        detail["loop"],
+        detail["address"],
+        detail["sub_address"],
+    ) == (7, 11, 2, 15, 3)
+    assert detail["device_text"] == "Ward beacon"
+    assert detail["device_type"] == "Visual Alarm Device"
+    assert detail["output_group"] == 4
+    assert detail["output_group_name"] == "Ward beacons"
+    assert detail["ringing_style"] == "Alert"
+    device_text_detail = next(
+        row
+        for row in repository.fetch_change_details()
+        if row["raw_field"] == "Location text"
+    )
+    assert device_text_detail["field"] == "Device text"
+    assert device_text_detail["description"] == "Device text changed"
+    total_history = repository.fetch_change_details(
+        include_all_imports=True
+    )
+    assert len(total_history) == 3
+    assert [row["source_name"] for row in total_history] == [
+        "new.skf",
+        "new.skf",
+        "old.skf",
+    ]
+
+
+def test_configuration_changes_include_output_groups_by_node(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "output-group-changes.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+
+    def add_group_line(
+        connection,
+        snapshot_id,
+        source_row,
+        group,
+        name,
+        style_number,
+        style,
+        style_name,
+        zone_from,
+        zone_to,
+    ):
+        connection.execute(
+            """
+            INSERT INTO configuration_output_group_lines(
+                snapshot_id, source_row, target_node, target_node_name,
+                output_group, output_group_name, operation,
+                output_style_number, ringing_style, ringing_style_name,
+                zone_from, zone_to, zone_qualifiers
+            ) VALUES (?, ?, 7, 'Panel Seven', ?, ?, 0, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                snapshot_id,
+                source_row,
+                group,
+                name,
+                style_number,
+                style,
+                style_name,
+                zone_from,
+                zone_to,
+            ),
+        )
+
+    with repository.connection() as connection:
+        old_snapshot = connection.execute(
+            """
+            INSERT INTO snapshots(
+                imported_at, source_name, source_path, sha256,
+                versions_json, warnings_json
+            ) VALUES ('old', 'old.skf', 'old.skf', 'og-old', '[]', '[]')
+            """
+        ).lastrowid
+        new_snapshot = connection.execute(
+            """
+            INSERT INTO snapshots(
+                imported_at, source_name, source_path, sha256,
+                versions_json, warnings_json
+            ) VALUES ('new', 'new.skf', 'new.skf', 'og-new', '[]', '[]')
+            """
+        ).lastrowid
+        add_group_line(
+            connection, old_snapshot, 1, 10, "Ward sounders",
+            0, "E", "Evacuate", 10, 10,
+        )
+        add_group_line(
+            connection, old_snapshot, 2, 20, "Removed doors",
+            0, "E", "Evacuate", 20, 20,
+        )
+        add_group_line(
+            connection, new_snapshot, 1, 10, "Ward alert sounders",
+            2, "A", "Alert", 10, 12,
+        )
+        add_group_line(
+            connection, new_snapshot, 3, 30, "New beacons",
+            0, "E", "Evacuate", 30, 30,
+        )
+        changes = repository._calculate_changes(
+            connection, old_snapshot, new_snapshot
+        )
+        connection.executemany(
+            """
+            INSERT INTO changes(
+                snapshot_id, entity, stable_key, change_type,
+                field, old_value, new_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    new_snapshot,
+                    change.entity,
+                    change.stable_key,
+                    change.change_type,
+                    change.field,
+                    change.old_value,
+                    change.new_value,
+                )
+                for change in changes
+            ],
+        )
+
+    output_changes = [
+        change for change in changes
+        if change.entity == "output_group"
+    ]
+    assert {
+        (change.stable_key, change.change_type, change.field)
+        for change in output_changes
+    } == {
+        ("node 7/group 10", "modified", "output_group_name"),
+        ("node 7/group 10", "modified", "zone_triggers"),
+        ("node 7/group 10", "modified", "ringing_styles"),
+        ("node 7/group 20", "removed", None),
+        ("node 7/group 30", "added", None),
+    }
+    details = [
+        row
+        for row in repository.fetch_change_details(new_snapshot)
+        if row["entity"] == "output_group"
+    ]
+    assert {row["node"] for row in details} == {7}
+    assert {row["output_group"] for row in details} == {10, 20, 30}
+    assert {
+        row["panel"] for row in details
+    } == {"Panel Seven"}
+    assert {
+        row["field"] for row in details
+        if row["change_type"] == "modified"
+    } == {
+        "Output group name",
+        "Zone trigger extent",
+        "Ringing styles",
+    }
+    before_backfill = len(repository.fetch_changes(new_snapshot))
+    repository._backfill_configuration_output_group_changes()
+    assert len(repository.fetch_changes(new_snapshot)) == before_backfill
 
 
 def _workbook(path: Path) -> Path:
@@ -155,9 +535,23 @@ def test_testing_workbook_round_trips_selected_zone_output_groups(
     workbook = load_workbook(workbook_path)
     assert workbook.sheetnames == [
         "Instructions",
+        "Zone List",
         "Test Sessions",
         "Test Results",
     ]
+    zone_list = workbook["Zone List"]
+    assert [cell.value for cell in zone_list[1]] == ZONE_HEADERS
+    assert zone_list.freeze_panes == "A2"
+    assert {
+        (
+            str(zone_list.cell(row=row, column=1).value),
+            zone_list.cell(row=row, column=3).value,
+        )
+        for row in range(2, zone_list.max_row + 1)
+    } == {
+        ("1", "Yes"),
+        ("1.11", "No"),
+    }
     results = workbook["Test Results"]
     assert [cell.value for cell in results[1]] == RESULT_HEADERS
     assert results.freeze_panes == "A2"
@@ -217,12 +611,323 @@ def test_zone_geometry_can_be_moved_reassigned_and_unassigned(
     assert json.loads(
         repository.fetch_zone_geometry()[0]["geometry_json"]
     ) == [[5.0, 4.0], [15.0, 4.0], [15.0, 14.0], [5.0, 4.0]]
-
     repository.reassign_zone_geometry(geometry["id"], 11)
     reassigned = repository.fetch_zone_geometry()[0]
     assert reassigned["zone"] == 11
     repository.remove_zone_geometry(reassigned["id"])
     assert repository.fetch_zone_geometry() == []
+
+
+def test_zone_can_span_floors_but_has_one_polygon_per_floor(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "multi-floor-zone.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+    ground_id = repository.add_floor("Ground", 0)
+    first_id = repository.add_floor("First", 1)
+    with repository.connection() as connection:
+        connection.execute(
+            "INSERT INTO zones(number, description) VALUES (10, 'Stair')"
+        )
+
+    ground = [(0, 0), (10, 0), (10, 10), (0, 0)]
+    first = [(20, 20), (30, 20), (30, 30), (20, 20)]
+    repository.assign_zone_geometry(10, ground_id, ground, "USER_DRAWN")
+    repository.assign_zone_geometry(10, first_id, first, "USER_DRAWN")
+
+    geometries = repository.fetch_zone_geometry()
+    assert [(row["zone"], row["floor_id"]) for row in geometries] == [
+        (10, first_id),
+        (10, ground_id),
+    ]
+    assert repository.fetch_zones()[0]["floor_name"] == "First, Ground"
+
+    replacement = [(21, 21), (31, 21), (31, 31), (21, 21)]
+    repository.assign_zone_geometry(
+        10, first_id, replacement, "REPLACEMENT"
+    )
+    geometries = repository.fetch_zone_geometry()
+    assert len(geometries) == 2
+    first_geometry = next(
+        row for row in geometries if row["floor_id"] == first_id
+    )
+    assert json.loads(first_geometry["geometry_json"]) == [
+        [21.0, 21.0],
+        [31.0, 21.0],
+        [31.0, 31.0],
+        [21.0, 21.0],
+    ]
+
+
+def test_door_records_both_zones_functions_and_linked_devices(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "doors.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+    floor_id = repository.add_floor("Ground", 0)
+    with repository.connection() as connection:
+        connection.executemany(
+            "INSERT INTO zones(number, description) VALUES (?, ?)",
+            [(10, "Ward"), (11, "Corridor")],
+        )
+        snapshot_id = connection.execute(
+            """
+            INSERT INTO snapshots(
+                imported_at, source_name, source_path, sha256,
+                versions_json, warnings_json
+            ) VALUES ('2026-07-25', 'test', '', 'doors-test', '{}', '[]')
+            """
+        ).lastrowid
+        connection.executemany(
+            """
+            INSERT INTO devices(
+                snapshot_id, stable_key, node, panel, loop, address,
+                sub_address, zone, text, product_code, observed_type,
+                output_group, output_group_name, ringing_style, record_offset
+            ) VALUES (?, ?, 1, 'Panel', 1, ?, 0, ?, ?, 0, ?, ?, ?, '', 0)
+            """,
+            [
+                (
+                    snapshot_id,
+                    "1/1/20/0",
+                    20,
+                    10,
+                    "Door access relay",
+                    "Output relay",
+                    20,
+                    "Access releases",
+                ),
+                (
+                    snapshot_id,
+                    "1/1/21/0",
+                    21,
+                    11,
+                    "Door hold-open magnet",
+                    "Output relay",
+                    21,
+                    "Hold opens",
+                ),
+            ],
+        )
+
+    door_id = repository.create_door(
+        "Ward entrance",
+        floor_id,
+        (10, 20),
+        (40, 20),
+        10,
+        11,
+        True,
+        "1/1/20/0",
+        "LOCKED",
+        True,
+        "1/1/21/0",
+        "HELD OPEN",
+        "Release on a fire condition either side.",
+        door_type="DOUBLE",
+        sprite_position=(25, 20),
+        rotation_degrees=90,
+    )
+
+    door = repository.fetch_doors(floor_id)[0]
+    assert door["id"] == door_id
+    assert (door["zone_a"], door["zone_b"]) == (10, 11)
+    assert door["access_device_key"] == "1/1/20/0"
+    assert door["hold_open_device_key"] == "1/1/21/0"
+    assert door["door_type"] == "DOUBLE"
+    assert (door["sprite_x"], door["sprite_y"]) == (25, 20)
+    assert door["rotation_degrees"] == 90
+    assert repository.suggest_door_control_devices(10, 11, "access")[0][
+        "stable_key"
+    ] == "1/1/20/0"
+
+    repository.update_door(
+        door_id,
+        "Ward entrance",
+        floor_id,
+        (10, 20),
+        (40, 20),
+        10,
+        11,
+        True,
+        "1/1/20/0",
+        "UNLOCKED",
+        True,
+        "1/1/21/0",
+        "CLOSED",
+        "",
+        door_type="SINGLE",
+        sprite_position=(30, 25),
+        rotation_degrees=45,
+    )
+    updated = repository.fetch_doors()[0]
+    assert updated["access_normal_state"] == "UNLOCKED"
+    assert updated["hold_open_normal_state"] == "CLOSED"
+    assert updated["door_type"] == "SINGLE"
+    assert (updated["sprite_x"], updated["sprite_y"]) == (30, 25)
+    assert updated["rotation_degrees"] == 45
+    repository.move_door(door_id, 35, 28)
+    moved = repository.fetch_doors()[0]
+    assert (moved["sprite_x"], moved["sprite_y"]) == (35, 28)
+    assert moved["rotation_degrees"] == 45
+    assert generate_door_rules(repository) == 4
+    door_rules = [
+        row
+        for row in repository.fetch_rules()
+        if row["source"] == "Door drawing suggestion"
+    ]
+    assert {
+        (row["trigger_zone"], row["output_group"], row["action"])
+        for row in door_rules
+    } == {
+        (10, 20, "UNLOCK DOOR"),
+        (11, 20, "UNLOCK DOOR"),
+        (10, 21, "CLOSE FIRE DOOR"),
+        (11, 21, "CLOSE FIRE DOOR"),
+    }
+    repository.delete_door(door_id)
+    assert repository.fetch_doors() == []
+
+    unassigned_id = repository.create_door(
+        "Internal unassigned entrance",
+        floor_id,
+        (0, 0),
+        (1, 0),
+        10,
+        10,
+        True,
+        None,
+        "LOCKED",
+        True,
+        None,
+        "HELD OPEN",
+        door_type="SINGLE",
+        sprite_position=(50, 50),
+    )
+    unassigned = repository.fetch_doors()[0]
+    assert unassigned["id"] == unassigned_id
+    assert (unassigned["zone_a"], unassigned["zone_b"]) == (10, 10)
+    assert unassigned["access_device_key"] is None
+    assert unassigned["hold_open_device_key"] is None
+
+    repository.update_door(
+        unassigned_id,
+        "Internal unassigned entrance",
+        floor_id,
+        (0, 0),
+        (1, 0),
+        10,
+        10,
+        True,
+        "1/1/20/0",
+        "LOCKED",
+        True,
+        "1/1/21/0",
+        "HELD OPEN",
+        door_type="SINGLE",
+        sprite_position=(50, 50),
+    )
+    assigned_later = repository.fetch_doors()[0]
+    assert assigned_later["access_device_key"] == "1/1/20/0"
+    assert assigned_later["hold_open_device_key"] == "1/1/21/0"
+    assert generate_door_rules(repository) == 2
+    assert all(
+        "within zone 10" in row["notes"]
+        for row in repository.fetch_rules()
+        if row["source"] == "Door drawing suggestion"
+    )
+
+
+def test_existing_door_table_migrates_to_allow_same_zone(tmp_path: Path) -> None:
+    project_path = tmp_path / "old-door-check.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+    with repository.connection() as connection:
+        connection.execute("DROP INDEX ix_doors_floor")
+        connection.execute("DROP INDEX ix_doors_zones")
+        connection.execute("DROP TABLE doors")
+        connection.execute(
+            """
+            CREATE TABLE doors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+                start_x REAL NOT NULL,
+                start_y REAL NOT NULL,
+                end_x REAL NOT NULL,
+                end_y REAL NOT NULL,
+                zone_a INTEGER NOT NULL REFERENCES zones(number),
+                zone_b INTEGER NOT NULL REFERENCES zones(number),
+                has_access_control INTEGER NOT NULL DEFAULT 0,
+                access_device_key TEXT,
+                access_normal_state TEXT NOT NULL DEFAULT 'LOCKED',
+                has_hold_open INTEGER NOT NULL DEFAULT 0,
+                hold_open_device_key TEXT,
+                hold_open_normal_state TEXT NOT NULL DEFAULT 'HELD OPEN',
+                door_type TEXT NOT NULL DEFAULT 'SINGLE',
+                sprite_x REAL,
+                sprite_y REAL,
+                rotation_degrees REAL NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                CHECK(zone_a <> zone_b),
+                CHECK(has_access_control = 1 OR has_hold_open = 1)
+            )
+            """
+        )
+
+    repository = ProjectRepository(project_path)
+    floor_id = repository.add_floor("Ground", 0)
+    with repository.connection() as connection:
+        connection.execute(
+            "INSERT INTO zones(number, description) VALUES (10, 'Ward')"
+        )
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'doors'"
+        ).fetchone()["sql"]
+    assert "ZONE_A<>ZONE_B" not in "".join(schema.upper().split())
+
+    repository.create_door(
+        "Internal ward door",
+        floor_id,
+        (0, 0),
+        (1, 0),
+        10,
+        10,
+        True,
+        None,
+        "LOCKED",
+        False,
+        None,
+        "CLOSED",
+    )
+    assert repository.fetch_doors()[0]["zone_b"] == 10
+
+
+def test_deleted_dxf_polygon_is_ignored_until_underlay_changes(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "ignored-polygon.fcp"
+    sqlite3.connect(project_path).close()
+    repository = ProjectRepository(project_path)
+    floor_id = repository.add_floor("Ground", 0)
+    points = [(0, 0), (10, 0), (10, 10), (0, 0)]
+
+    repository.ignore_zone_shape(
+        floor_id,
+        points,
+        "ZONE_OUTLINES",
+    )
+    repository = ProjectRepository(project_path)
+    assert repository.fetch_ignored_zone_shape_keys(floor_id) == {
+        zone_shape_key(points)
+    }
+
+    replacement = tmp_path / "replacement.dxf"
+    replacement.write_text("placeholder", encoding="utf-8")
+    repository.set_floor_dxf(floor_id, replacement)
+    assert repository.fetch_ignored_zone_shape_keys(floor_id) == set()
 
 
 def test_project_tracks_added_removed_and_modified_matrix_cells(

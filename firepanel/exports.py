@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 import zipfile
+from xml.sax.saxutils import escape
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -27,17 +29,76 @@ def export_change_pdf(
     repository: ProjectRepository,
     target: str | Path,
     snapshot_id: int | None = None,
+    revision_ids: list[int] | None = None,
 ) -> Path:
     destination = Path(target)
-    requested_snapshot = snapshot_id
-    snapshot_id = snapshot_id or repository.latest_snapshot_id()
-    changes = repository.fetch_changes(
-        snapshot_id if requested_snapshot is not None else None
+    changes = repository.fetch_change_details(
+        include_all_imports=True,
     )
-    snapshots = {row["id"]: row for row in repository.fetch_snapshots()}
-    snapshot = snapshots.get(snapshot_id)
+    history = repository.fetch_project_history()
+    revisions = sorted(
+        (dict(row) for row in repository.fetch_snapshots()),
+        key=lambda row: (str(row["imported_at"]), int(row["id"])),
+    )
+    if snapshot_id is not None:
+        revision_ids = [int(snapshot_id)]
+    selected_revision_ids = (
+        {int(value) for value in revision_ids}
+        if revision_ids is not None
+        else {int(row["id"]) for row in revisions}
+    )
+    revisions = [
+        row for row in revisions
+        if int(row["id"]) in selected_revision_ids
+    ]
+    all_revisions = sorted(
+        (dict(row) for row in repository.fetch_snapshots()),
+        key=lambda row: (str(row["imported_at"]), int(row["id"])),
+    )
+    changes_by_revision: dict[int, list[dict]] = {
+        int(row["id"]): [] for row in revisions
+    }
+    history_by_revision: dict[int, list[dict]] = {
+        int(row["id"]): [] for row in revisions
+    }
+    for change in changes:
+        revision_id = (
+            int(change["snapshot_id"])
+            if change.get("snapshot_id") is not None
+            else _revision_id_at(
+                str(change.get("changed_at") or ""),
+                all_revisions,
+            )
+        )
+        if revision_id in changes_by_revision:
+            changes_by_revision[revision_id].append(change)
+    for change in history:
+        revision_id = _revision_id_at(
+            str(change.get("changed_at") or ""),
+            all_revisions,
+        )
+        if revision_id in history_by_revision:
+            history_by_revision[revision_id].append(change)
+
+    selected_changes = sum(
+        (changes_by_revision[int(row["id"])] for row in revisions),
+        [],
+    )
+    selected_history = sum(
+        (history_by_revision[int(row["id"])] for row in revisions),
+        [],
+    )
     matrix_import = repository.latest_cause_effect_import()
     styles = getSampleStyleSheet()
+    section_style = styles["Heading2"].clone("NodeSection")
+    section_style.keepWithNext = True
+    section_style.spaceBefore = 5 * mm
+    subsection_style = styles["Heading3"].clone("ChangeSubsection")
+    subsection_style.keepWithNext = True
+    subsection_style.spaceBefore = 2 * mm
+    table_text_style = styles["BodyText"].clone("ChangeTableText")
+    table_text_style.fontSize = 7
+    table_text_style.leading = 8.5
 
     document = SimpleDocTemplate(
         str(destination),
@@ -46,70 +107,97 @@ def export_change_pdf(
         rightMargin=14 * mm,
         topMargin=13 * mm,
         bottomMargin=13 * mm,
-        title=f"{repository.name} — project tracked changes",
+        title=f"{repository.name} - project tracked changes",
         author="FirePanel",
     )
     story = [
-        Paragraph(f"{repository.name} — project tracked changes", styles["Title"]),
+        Paragraph(
+            _paragraph_text(
+                f"{repository.name} - project tracked changes"
+            ),
+            styles["Title"],
+        ),
         Spacer(1, 4 * mm),
         Paragraph(
-            f"Configuration: {snapshot['source_name'] if snapshot else 'None'}"
-            f"{' — imported ' + snapshot['imported_at'] if snapshot else ''}<br/>"
+            f"Configuration revisions: {len(revisions)} selected of "
+            f"{len(all_revisions)}<br/>"
             f"Cause &amp; Effect: "
             f"{matrix_import['source_name'] if matrix_import else 'None'}"
-            f"{' — imported ' + matrix_import['imported_at'] if matrix_import else ''}<br/>"
-            f"Generated: {datetime.now().isoformat(timespec='minutes')}",
+            f"{' - imported ' + matrix_import['imported_at'] if matrix_import else ''}<br/>"
+            f"Generated: {datetime.now().isoformat(timespec='minutes')}<br/>"
+            "Scope: configuration differences and recorded project history "
+            "associated with the selected revisions",
             styles["Normal"],
         ),
         Spacer(1, 5 * mm),
     ]
-    if not changes:
+    if not revisions:
+        story.append(
+            Paragraph("No revisions were selected.", styles["Heading2"])
+        )
+    elif not selected_changes and not selected_history:
         story.append(
             Paragraph(
-                "No changes were recorded for the selected project imports.",
+                "No project changes were recorded for the selected revisions.",
                 styles["Heading2"],
             )
         )
     else:
-        rows = [["Type", "Entity", "Key", "Field", "Previous", "Current"]]
-        rows.extend(
+        story.extend(
             [
-                [
-                    row["change_type"].upper(),
-                    row["entity"],
-                    row["stable_key"],
-                    row["field"] or "",
-                    row["old_value"] or "",
-                    row["new_value"] or "",
-                ]
-                for row in changes
+                Paragraph("Total change history", styles["Heading1"]),
+                Paragraph(
+                    f"<b>{len(selected_changes) + len(selected_history)}</b> "
+                    f"recorded changes across {len(revisions)} selected "
+                    f"revision{'s' if len(revisions) != 1 else ''}: "
+                    f"{len(selected_changes)} configuration/Cause &amp; Effect "
+                    f"changes and {len(selected_history)} ongoing project "
+                    "history entries.",
+                    styles["Normal"],
+                ),
+                Spacer(1, 2 * mm),
             ]
         )
-        table = Table(rows, repeatRows=1, colWidths=[24 * mm, 22 * mm, 34 * mm, 25 * mm, 69 * mm, 69 * mm])
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#183153")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5E1")),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ]
+        revision_numbers = {
+            int(row["id"]): index
+            for index, row in enumerate(all_revisions, 1)
+        }
+        for revision in revisions:
+            revision_id = int(revision["id"])
+            story.append(PageBreak())
+            story.append(
+                Paragraph(
+                    _paragraph_text(
+                        f"Revision {revision_numbers[revision_id]} — "
+                        f"{revision['source_name']}"
+                    ),
+                    styles["Heading1"],
+                )
             )
-        )
-        story.append(table)
+            story.append(
+                Paragraph(
+                    f"Imported {_paragraph_text(revision['imported_at'])}",
+                    styles["Normal"],
+                )
+            )
+            _append_revision_changes(
+                story,
+                changes_by_revision[revision_id],
+                history_by_revision[revision_id],
+                section_style,
+                subsection_style,
+                table_text_style,
+            )
+
         story.extend(
             [
                 PageBreak(),
                 Paragraph("Review and approval", styles["Heading1"]),
                 Paragraph(
-                    "This report identifies configuration and Cause &amp; Effect "
-                    "differences. It does not by itself approve the fire strategy or "
-                    "demonstrate successful cause-and-effect testing.",
+                    "This report contains configuration and Cause &amp; Effect "
+                    "differences together with the recorded project history for "
+                    "the selected revisions. It does not by itself approve the fire "
+                    "strategy or demonstrate successful cause-and-effect testing.",
                     styles["Normal"],
                 ),
                 Spacer(1, 12 * mm),
@@ -120,8 +208,300 @@ def export_change_pdf(
                 Paragraph("Date: ___________________________________________", styles["Normal"]),
             ]
         )
-    document.build(story)
+    document.build(
+        story,
+        onFirstPage=_draw_change_pdf_footer,
+        onLaterPages=_draw_change_pdf_footer,
+    )
     return destination
+
+
+def _revision_id_at(
+    changed_at: str,
+    revisions: list[dict],
+) -> int | None:
+    if not revisions:
+        return None
+    revision_id = int(revisions[0]["id"])
+    if not changed_at:
+        return int(revisions[-1]["id"])
+    for revision in revisions:
+        if str(revision["imported_at"]) > changed_at:
+            break
+        revision_id = int(revision["id"])
+    return revision_id
+
+
+def _append_revision_changes(
+    story: list,
+    changes: list[dict],
+    history: list[dict],
+    section_style,
+    subsection_style,
+    table_text_style,
+) -> None:
+    if not changes and not history:
+        story.append(
+            Paragraph(
+                "No changes were recorded during this revision.",
+                subsection_style,
+            )
+        )
+        return
+    changes_by_node = _group_changes_by_node(changes)
+    history_by_node = _group_changes_by_node(history)
+    nodes = sorted(
+        {
+            node
+            for node in set(changes_by_node) | set(history_by_node)
+            if node is not None
+        }
+    )
+    for node in nodes:
+        node_changes = changes_by_node.get(node, [])
+        node_history = history_by_node.get(node, [])
+        panel_names = sorted(
+            {
+                str(row.get("panel") or "").strip()
+                for row in node_changes
+                if str(row.get("panel") or "").strip()
+            }
+        )
+        node_title = f"Node {node}"
+        if panel_names:
+            node_title += f" - {', '.join(panel_names)}"
+        story.append(Paragraph(_paragraph_text(node_title), section_style))
+        if node_changes:
+            story.append(
+                Paragraph("Configuration changes", subsection_style)
+            )
+            story.append(
+                _configuration_changes_table(
+                    node_changes, table_text_style
+                )
+            )
+        if node_history:
+            story.append(Paragraph("Project history", subsection_style))
+            story.append(
+                _project_history_table(node_history, table_text_style)
+            )
+
+    project_changes = changes_by_node.get(None, [])
+    project_history = history_by_node.get(None, [])
+    if project_changes or project_history:
+        story.append(Paragraph("Other project changes", section_style))
+        if project_changes:
+            story.append(
+                Paragraph("Configuration changes", subsection_style)
+            )
+            story.append(
+                _configuration_changes_table(
+                    project_changes, table_text_style
+                )
+            )
+        if project_history:
+            story.append(
+                Paragraph("Project history", subsection_style)
+            )
+            story.append(
+                _project_history_table(
+                    project_history, table_text_style
+                )
+            )
+
+
+def _node_for_change(change: dict) -> int | None:
+    node = change.get("node")
+    if node not in (None, ""):
+        try:
+            return int(node)
+        except (TypeError, ValueError):
+            pass
+    match = re.search(
+        r"\bnode\s+(\d+)\b",
+        str(change.get("stable_key") or ""),
+        flags=re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _group_changes_by_node(
+    changes: list[dict],
+) -> dict[int | None, list[dict]]:
+    grouped: dict[int | None, list[dict]] = {}
+    for change in changes:
+        grouped.setdefault(_node_for_change(change), []).append(change)
+    return grouped
+
+
+def _paragraph_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    text = (
+        text.replace("→", "->")
+        .replace("—", "-")
+        .replace("–", "-")
+    )
+    return escape(text).replace("\n", "<br/>")
+
+
+def _draw_change_pdf_footer(canvas, document) -> None:
+    canvas.saveState()
+    canvas.setFillColor(colors.HexColor("#64748B"))
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(
+        14 * mm,
+        7 * mm,
+        "FirePanel project tracked changes",
+    )
+    canvas.drawRightString(
+        landscape(A4)[0] - 14 * mm,
+        7 * mm,
+        f"Page {document.page}",
+    )
+    canvas.restoreState()
+
+
+def _table_cell(value: object, style) -> Paragraph:
+    return Paragraph(_paragraph_text(value), style)
+
+
+def _change_table_style() -> TableStyle:
+    return TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#183153")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 7),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.25,
+                colors.HexColor("#CBD5E1"),
+            ),
+            (
+                "ROWBACKGROUNDS",
+                (0, 1),
+                (-1, -1),
+                [colors.white, colors.HexColor("#F8FAFC")],
+            ),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+    )
+
+
+def _configuration_changes_table(changes: list[dict], style) -> Table:
+    headers = [
+        "Type",
+        "Import",
+        "Change",
+        "Address",
+        "Zone",
+        "Device text",
+        "Device type",
+        "Output group",
+        "Field",
+        "Previous",
+        "Current",
+    ]
+    rows = [headers]
+    for change in changes:
+        address = ""
+        if change.get("loop") is not None:
+            address = (
+                f"L{change['loop']} / A{change['address']} / "
+                f"S{change['sub_address']}"
+            )
+        output_group = ""
+        if change.get("output_group") is not None:
+            output_group = str(change["output_group"])
+            if str(change.get("output_group_name") or "").strip():
+                output_group += f" — {change['output_group_name']}"
+            if str(change.get("ringing_style") or "").strip():
+                output_group += f" ({change['ringing_style']})"
+        rows.append(
+            [
+                _table_cell(str(change["change_type"]).upper(), style),
+                _table_cell(
+                    "\n".join(
+                        value
+                        for value in (
+                            str(change.get("changed_at") or ""),
+                            str(change.get("source_name") or ""),
+                        )
+                        if value
+                    ),
+                    style,
+                ),
+                _table_cell(change.get("description"), style),
+                _table_cell(address or change.get("stable_key"), style),
+                _table_cell(change.get("zone"), style),
+                _table_cell(change.get("device_text"), style),
+                _table_cell(change.get("device_type"), style),
+                _table_cell(output_group, style),
+                _table_cell(change.get("field"), style),
+                _table_cell(change.get("old_value"), style),
+                _table_cell(change.get("new_value"), style),
+            ]
+        )
+    table = Table(
+        rows,
+        repeatRows=1,
+        colWidths=[
+            15 * mm,
+            30 * mm,
+            25 * mm,
+            24 * mm,
+            12 * mm,
+            29 * mm,
+            23 * mm,
+            27 * mm,
+            19 * mm,
+            32.5 * mm,
+            32.5 * mm,
+        ],
+    )
+    table.setStyle(_change_table_style())
+    return table
+
+
+def _project_history_table(history: list[dict], style) -> Table:
+    rows = [
+        ["Date/time", "Type", "Area", "Record", "Fields", "Description"]
+    ]
+    rows.extend(
+        [
+            [
+                _table_cell(change.get("changed_at"), style),
+                _table_cell(
+                    str(change.get("change_type") or "").upper(), style
+                ),
+                _table_cell(change.get("area"), style),
+                _table_cell(change.get("record_key"), style),
+                _table_cell(change.get("fields"), style),
+                _table_cell(change.get("summary"), style),
+            ]
+            for change in history
+        ]
+    )
+    table = Table(
+        rows,
+        repeatRows=1,
+        colWidths=[
+            34 * mm,
+            18 * mm,
+            35 * mm,
+            45 * mm,
+            43 * mm,
+            94 * mm,
+        ],
+    )
+    table.setStyle(_change_table_style())
+    return table
 
 
 def export_devices_xlsx(repository: ProjectRepository, target: str | Path) -> Path:

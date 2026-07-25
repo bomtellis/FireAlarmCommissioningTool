@@ -27,6 +27,9 @@ firepanel = "main:main"
 [tool.setuptools]
 packages = ["firepanel"]
 
+[tool.setuptools.package-data]
+firepanel = ["assets/*.ico"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

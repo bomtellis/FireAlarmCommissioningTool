@@ -15,7 +15,14 @@ from .device_catalog import (
     KNOWN_CATALOGUE_CODES,
     protocols_for_code,
 )
-from .models import Device, DeviceChannel, Panel, ParsedNcf, Zone
+from .models import (
+    ConfigurationOutputGroupLine,
+    Device,
+    DeviceChannel,
+    Panel,
+    ParsedNcf,
+    Zone,
+)
 
 
 POINT_RECORD_SIZE = 224
@@ -646,6 +653,7 @@ def _parse_skf(source: Path, digest: str) -> ParsedNcf:
             if _skf_integer(row, "NetworkAddress") > 0
         }
         group_style_names: dict[tuple[int, int], set[str]] = defaultdict(set)
+        output_group_lines: list[ConfigurationOutputGroupLine] = []
         for _, row in output_line_rows:
             node = _skf_integer(row, "NetworkAddress")
             group = _skf_integer(row, "GroupNo")
@@ -653,6 +661,32 @@ def _parse_skf(source: Path, digest: str) -> ParsedNcf:
             style = style_names.get((node, style_number))
             if node > 0 and group > 0 and style:
                 group_style_names[(node, group)].add(style)
+        for source_row, row in output_line_rows:
+            node = _skf_integer(row, "NetworkAddress")
+            group = _skf_integer(row, "GroupNo")
+            if node <= 0 or group <= 0:
+                continue
+            style_number = _skf_integer(row, "OutputStyleNo", -1)
+            style_name = style_names.get(
+                (node, style_number),
+                f"Style {style_number}",
+            )
+            output_group_lines.append(
+                ConfigurationOutputGroupLine(
+                    source_row=int(source_row),
+                    target_node=node,
+                    target_node_name=node_names.get(node, ""),
+                    output_group=group,
+                    output_group_name=group_names.get((node, group), ""),
+                    operation=_skf_integer(row, "Operation", -1),
+                    output_style_number=style_number,
+                    ringing_style=_ringing_style_code(style_name),
+                    ringing_style_name=style_name,
+                    zone_from=_skf_integer(row, "ZoneFrom"),
+                    zone_to=_skf_integer(row, "ZoneTo"),
+                    zone_qualifiers=_skf_integer(row, "ZoneQualifiers"),
+                )
+            )
 
         panel_devices: dict[int, OrderedDict[tuple[int, int], Device]] = {
             node: OrderedDict() for node, _ in nodes
@@ -779,6 +813,7 @@ def _parse_skf(source: Path, digest: str) -> ParsedNcf:
         zones=zones,
         archive_entries=entries,
         warnings=warnings,
+        output_group_lines=output_group_lines,
     )
 
 

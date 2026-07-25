@@ -16,6 +16,7 @@ from .cause_effect import normalise_zone_key
 SCHEMA_VERSION = "firepanel-testing-v1"
 SESSION_SHEET = "Test Sessions"
 RESULT_SHEET = "Test Results"
+ZONE_SHEET = "Zone List"
 SESSION_HEADERS = [
     "Session Key",
     "Trigger Zone",
@@ -38,6 +39,14 @@ RESULT_HEADERS = [
     "Output Group",
     "Output Group Name",
     "Ringing Style",
+]
+ZONE_HEADERS = [
+    "Zone",
+    "Zone Name",
+    "Selected for Testing",
+    "Nodes",
+    "Floors",
+    "Device Count",
 ]
 
 
@@ -65,26 +74,41 @@ def export_testing_workbook(
     if not selected:
         raise ValueError("Select at least one trigger zone.")
 
+    all_activations = list(
+        repository.fetch_cause_effect_activations()
+    )
     activations = [
         row
-        for row in repository.fetch_cause_effect_activations()
+        for row in all_activations
         if normalise_zone_key(row["trigger_zone"]) in selected
     ]
     by_zone: dict[str, list] = {zone: [] for zone in selected}
     zone_names: dict[str, str] = {}
+    for activation in all_activations:
+        zone = normalise_zone_key(activation["trigger_zone"])
+        name = str(activation["trigger_zone_name"] or "").strip()
+        if name:
+            zone_names[zone] = name
     for activation in activations:
         zone = normalise_zone_key(activation["trigger_zone"])
         by_zone.setdefault(zone, []).append(activation)
         name = str(activation["trigger_zone_name"] or "").strip()
         if name:
             zone_names[zone] = name
-    for zone in repository.fetch_zones():
+    project_zones = list(repository.fetch_zones())
+    project_zone_values = {}
+    for zone in project_zones:
         key = normalise_zone_key(zone["number"])
-        zone_names.setdefault(key, str(zone["description"] or "").strip())
+        values = dict(zone)
+        project_zone_values[key] = values
+        zone_names.setdefault(
+            key, str(values.get("description") or "").strip()
+        )
 
     workbook = Workbook()
     instructions = workbook.active
     instructions.title = "Instructions"
+    zone_list = workbook.create_sheet(ZONE_SHEET)
     sessions = workbook.create_sheet(SESSION_SHEET)
     results = workbook.create_sheet(RESULT_SHEET)
 
@@ -105,14 +129,42 @@ def export_testing_workbook(
             "or the output-group reference columns."
         ]
     )
+    instructions.append(
+        [
+            "Use the Zone List worksheet as a reference for all project zones; "
+            "zones included in this testing export are marked Yes."
+        ]
+    )
     instructions.column_dimensions["A"].width = 105
     instructions.column_dimensions["B"].width = 35
     instructions["A1"].font = Font(size=16, bold=True, color="183153")
     instructions["A5"].alignment = Alignment(wrap_text=True, vertical="top")
     instructions["A6"].alignment = Alignment(wrap_text=True, vertical="top")
+    instructions["A7"].alignment = Alignment(wrap_text=True, vertical="top")
     instructions.row_dimensions[5].height = 42
     instructions.row_dimensions[6].height = 38
+    instructions.row_dimensions[7].height = 32
     instructions.sheet_view.showGridLines = False
+
+    zone_list.append(ZONE_HEADERS)
+    zone_rows = []
+    for key in sorted(
+        set(zone_names) | set(project_zone_values),
+        key=_zone_sort_key,
+    ):
+        values = project_zone_values.get(key, {})
+        zone_rows.append(
+            [
+                key,
+                zone_names.get(key, ""),
+                "Yes" if key in selected else "No",
+                str(values.get("nodes") or "").strip(),
+                str(values.get("floor_name") or "").strip(),
+                int(values.get("device_count") or 0),
+            ]
+        )
+    for row in zone_rows:
+        zone_list.append(row)
 
     sessions.append(SESSION_HEADERS)
     result_rows = []
@@ -153,11 +205,21 @@ def export_testing_workbook(
 
     _style_table_sheet(sessions, len(SESSION_HEADERS), len(selected))
     _style_table_sheet(results, len(RESULT_HEADERS), len(result_rows))
+    _style_table_sheet(zone_list, len(ZONE_HEADERS), len(zone_rows))
     _set_widths(sessions, [24, 14, 38, 22, 14, 45])
+    _set_widths(zone_list, [14, 48, 22, 24, 34, 16])
     _set_widths(
         results,
         [24, 14, 56, 17, 20, 16, 42, 22, 14, 34, 16, 42, 18],
     )
+    if zone_rows:
+        zone_list.conditional_formatting.add(
+            f"A2:F{len(zone_rows) + 1}",
+            FormulaRule(
+                formula=['$C2="Yes"'],
+                fill=PatternFill("solid", fgColor="D1E7DD"),
+            ),
+        )
 
     if result_rows:
         last_row = len(result_rows) + 1

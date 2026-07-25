@@ -57,6 +57,22 @@ class Zone:
     floor_id: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigurationOutputGroupLine:
+    source_row: int
+    target_node: int
+    target_node_name: str
+    output_group: int
+    output_group_name: str
+    operation: int
+    output_style_number: int
+    ringing_style: str
+    ringing_style_name: str
+    zone_from: int
+    zone_to: int
+    zone_qualifiers: int
+
+
 @dataclass(slots=True)
 class ParsedNcf:
     source: Path
@@ -66,6 +82,9 @@ class ParsedNcf:
     zones: list[Zone]
     archive_entries: list[dict[str, Any]]
     warnings: list[str] = field(default_factory=list)
+    output_group_lines: list[ConfigurationOutputGroupLine] = field(
+        default_factory=list
+    )
 
     @property
     def devices(self) -> list[Device]:
