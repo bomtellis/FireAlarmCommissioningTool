@@ -182,3 +182,15 @@ Cause & Effect Excel matrix can instead be imported and checked against its
 
 See [NCF_FORMAT_NOTES.md](NCF_FORMAT_NOTES.md) and
 [SKF_FORMAT_NOTES.md](SKF_FORMAT_NOTES.md) for the observed layouts.
+
+## Rights and licences
+
+FirePanel Commissioning is licensed under the GNU Affero General Public
+License version 3. The application rights notice is in
+[RIGHTS_NOTICE.md](RIGHTS_NOTICE.md).
+
+The versions, rights notices, and licence terms for every runtime,
+build, and test package are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), with verbatim upstream
+files under [LICENSES](LICENSES). The same notices are available from the
+application's About page and are included in packaged executables.

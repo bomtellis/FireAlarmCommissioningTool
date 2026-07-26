@@ -1,0 +1,438 @@
+[
+  {
+    "name": "CPython",
+    "version": "3.13.3",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "PSF-2.0",
+    "homepage": "https://www.python.org/",
+    "directory": "python-3.13.3",
+    "licence_files": [
+      "LICENSE.txt"
+    ]
+  },
+  {
+    "name": "altgraph",
+    "version": "0.17.5",
+    "scope": [
+      "build"
+    ],
+    "licence": "MIT",
+    "homepage": "https://altgraph.readthedocs.io/en/latest/",
+    "directory": "altgraph-0.17.5",
+    "licence_files": [
+      "altgraph-0.17.5.dist-info__LICENSE"
+    ]
+  },
+  {
+    "name": "charset-normalizer",
+    "version": "3.4.9",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://charset-normalizer.readthedocs.io/",
+    "directory": "charset-normalizer-3.4.9",
+    "licence_files": [
+      "charset_normalizer-3.4.9.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "colorama",
+    "version": "0.4.6",
+    "scope": [
+      "test"
+    ],
+    "licence": "BSD-3-Clause",
+    "homepage": "https://github.com/tartley/colorama",
+    "directory": "colorama-0.4.6",
+    "licence_files": [
+      "colorama-0.4.6.dist-info__licenses__LICENSE.txt"
+    ]
+  },
+  {
+    "name": "et_xmlfile",
+    "version": "2.0.0",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://openpyxl.pages.heptapod.net/et_xmlfile/",
+    "directory": "et-xmlfile-2.0.0",
+    "licence_files": [
+      "AUTHORS.txt",
+      "et_xmlfile-2.0.0.dist-info__AUTHORS.txt",
+      "et_xmlfile-2.0.0.dist-info__LICENCE.rst",
+      "LICENCE.python",
+      "LICENCE.rst"
+    ]
+  },
+  {
+    "name": "ezdxf",
+    "version": "1.4.4",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://github.com/mozman/ezdxf",
+    "directory": "ezdxf-1.4.4",
+    "licence_files": [
+      "ezdxf-1.4.4.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "fonttools",
+    "version": "4.63.0",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "http://github.com/fonttools/fonttools",
+    "directory": "fonttools-4.63.0",
+    "licence_files": [
+      "fonttools-4.63.0.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "iniconfig",
+    "version": "2.3.0",
+    "scope": [
+      "test"
+    ],
+    "licence": "MIT",
+    "homepage": "https://github.com/pytest-dev/iniconfig",
+    "directory": "iniconfig-2.3.0",
+    "licence_files": [
+      "iniconfig-2.3.0.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "numpy",
+    "version": "2.5.1",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+    "homepage": "",
+    "directory": "numpy-2.5.1",
+    "licence_files": [
+      "numpy-2.5.1.dist-info__licenses__LICENSE.txt",
+      "numpy-2.5.1.dist-info__licenses__numpy___core__include__numpy__libdivide__LICENSE.txt",
+      "numpy-2.5.1.dist-info__licenses__numpy___core__src__common__pythoncapi-compat__COPYING",
+      "numpy-2.5.1.dist-info__licenses__numpy___core__src__highway__LICENSE",
+      "numpy-2.5.1.dist-info__licenses__numpy___core__src__multiarray__dragon4_LICENSE.txt",
+      "numpy-2.5.1.dist-info__licenses__numpy___core__src__npysort__x86-simd-sort__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy___core__src__umath__svml__LICENSE",
+      "numpy-2.5.1.dist-info__licenses__numpy__fft__pocketfft__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__linalg__lapack_lite__LICENSE.txt",
+      "numpy-2.5.1.dist-info__licenses__numpy__ma__LICENSE",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__src__distributions__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__src__mt19937__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__src__pcg64__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__src__philox__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__src__sfc64__LICENSE.md",
+      "numpy-2.5.1.dist-info__licenses__numpy__random__src__splitmix64__LICENSE.md",
+      "numpy___core__include__numpy__random__LICENSE.txt",
+      "numpy__ma__LICENSE",
+      "numpy__random__LICENSE.md"
+    ]
+  },
+  {
+    "name": "openpyxl",
+    "version": "3.1.5",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://openpyxl.readthedocs.io/en/stable/",
+    "directory": "openpyxl-3.1.5",
+    "licence_files": [
+      "AUTHORS.rst",
+      "LICENCE.rst",
+      "openpyxl-3.1.5.dist-info__LICENCE.rst"
+    ]
+  },
+  {
+    "name": "packaging",
+    "version": "26.2",
+    "scope": [
+      "build",
+      "runtime",
+      "test"
+    ],
+    "licence": "Apache-2.0 OR BSD-2-Clause",
+    "homepage": "https://packaging.pypa.io/",
+    "directory": "packaging-26.2",
+    "licence_files": [
+      "packaging-26.2.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "pefile",
+    "version": "2024.8.26",
+    "scope": [
+      "build"
+    ],
+    "licence": "MIT",
+    "homepage": "https://github.com/erocarrera/pefile",
+    "directory": "pefile-2024.8.26",
+    "licence_files": [
+      "pefile-2024.8.26.dist-info__LICENSE"
+    ]
+  },
+  {
+    "name": "pillow",
+    "version": "12.3.0",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT-CMU",
+    "homepage": "https://pillow.readthedocs.io",
+    "directory": "pillow-12.3.0",
+    "licence_files": [
+      "pillow-12.3.0.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "pluggy",
+    "version": "1.6.0",
+    "scope": [
+      "test"
+    ],
+    "licence": "MIT",
+    "homepage": "",
+    "directory": "pluggy-1.6.0",
+    "licence_files": [
+      "pluggy-1.6.0.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "Pygments",
+    "version": "2.20.0",
+    "scope": [
+      "test"
+    ],
+    "licence": "BSD-2-Clause",
+    "homepage": "https://pygments.org",
+    "directory": "pygments-2.20.0",
+    "licence_files": [
+      "pygments-2.20.0.dist-info__licenses__AUTHORS",
+      "pygments-2.20.0.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "pyinstaller",
+    "version": "6.21.0",
+    "scope": [
+      "build"
+    ],
+    "licence": "GPLv2-or-later with a special exception which allows to use PyInstaller to build and distribute non-free programs (including commercial ones)",
+    "homepage": "https://pyinstaller.org",
+    "directory": "pyinstaller-6.21.0",
+    "licence_files": [
+      "pyinstaller-6.21.0.dist-info__licenses__COPYING.txt"
+    ]
+  },
+  {
+    "name": "pyinstaller-hooks-contrib",
+    "version": "2026.6",
+    "scope": [
+      "build"
+    ],
+    "licence": "GPL-2.0-or-later WITH PyInstaller-exception-2.0 AND Apache-2.0",
+    "homepage": "https://github.com/pyinstaller/pyinstaller-hooks-contrib",
+    "directory": "pyinstaller-hooks-contrib-2026.6",
+    "licence_files": [
+      "pyinstaller_hooks_contrib-2026.6.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "pyparsing",
+    "version": "3.3.2",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://pyparsing-docs.readthedocs.io/en/latest/",
+    "directory": "pyparsing-3.3.2",
+    "licence_files": [
+      "pyparsing-3.3.2.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "PySide6",
+    "version": "6.11.1",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "homepage": "https://pyside.org",
+    "directory": "pyside6-6.11.1",
+    "licence_files": [
+      "pyside6-6.11.1.dist-info__licenses__LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "PySide6_Addons",
+    "version": "6.11.1",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "homepage": "https://pyside.org",
+    "directory": "pyside6-addons-6.11.1",
+    "licence_files": [
+      "pyside6_addons-6.11.1.dist-info__licenses__LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "PySide6_Essentials",
+    "version": "6.11.1",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "homepage": "https://pyside.org",
+    "directory": "pyside6-essentials-6.11.1",
+    "licence_files": [
+      "pyside6_essentials-6.11.1.dist-info__licenses__LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "pytest",
+    "version": "8.4.2",
+    "scope": [
+      "test"
+    ],
+    "licence": "MIT",
+    "homepage": "https://docs.pytest.org/en/latest/",
+    "directory": "pytest-8.4.2",
+    "licence_files": [
+      "pytest-8.4.2.dist-info__licenses__AUTHORS",
+      "pytest-8.4.2.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "pywin32-ctypes",
+    "version": "0.2.3",
+    "scope": [
+      "build"
+    ],
+    "licence": "BSD-3-Clause",
+    "homepage": "https://github.com/enthought/pywin32-ctypes",
+    "directory": "pywin32-ctypes-0.2.3",
+    "licence_files": [
+      "pywin32_ctypes-0.2.3.dist-info__LICENSE.txt"
+    ]
+  },
+  {
+    "name": "QtAwesome",
+    "version": "1.4.2",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://github.com/spyder-ide/qtawesome",
+    "directory": "qtawesome-1.4.2",
+    "licence_files": [
+      "qtawesome-1.4.2.dist-info__licenses__LICENSE.txt"
+    ]
+  },
+  {
+    "name": "QtPy",
+    "version": "2.4.3",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "MIT",
+    "homepage": "https://github.com/spyder-ide/qtpy",
+    "directory": "qtpy-2.4.3",
+    "licence_files": [
+      "QtPy-2.4.3.dist-info__AUTHORS.md",
+      "QtPy-2.4.3.dist-info__LICENSE.txt"
+    ]
+  },
+  {
+    "name": "reportlab",
+    "version": "4.5.1",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "BSD-3-Clause",
+    "homepage": "https://www.reportlab.com/",
+    "directory": "reportlab-4.5.1",
+    "licence_files": [
+      "reportlab-4.5.1.dist-info__licenses__LICENSE"
+    ]
+  },
+  {
+    "name": "setuptools",
+    "version": "83.0.0",
+    "scope": [
+      "build"
+    ],
+    "licence": "MIT",
+    "homepage": "https://github.com/pypa/setuptools",
+    "directory": "setuptools-83.0.0",
+    "licence_files": [
+      "setuptools-83.0.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__autocommand-2.2.2.dist-info__LICENSE",
+      "setuptools___vendor__backports.tarfile-1.2.0.dist-info__LICENSE",
+      "setuptools___vendor__importlib_metadata-8.7.1.dist-info__licenses__LICENSE",
+      "setuptools___vendor__jaraco.text-4.0.0.dist-info__LICENSE",
+      "setuptools___vendor__jaraco_context-6.1.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__jaraco_functools-4.4.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__more_itertools-10.8.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__packaging-26.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__platformdirs-4.4.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__tomli-2.4.0.dist-info__licenses__LICENSE",
+      "setuptools___vendor__wheel-0.46.3.dist-info__licenses__LICENSE.txt",
+      "setuptools___vendor__zipp-3.23.0.dist-info__licenses__LICENSE",
+      "setuptools__config___validate_pyproject__NOTICE",
+      "setuptools__config__NOTICE"
+    ]
+  },
+  {
+    "name": "shapely",
+    "version": "2.1.2",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "BSD-3-Clause",
+    "homepage": "https://shapely.readthedocs.io/",
+    "directory": "shapely-2.1.2",
+    "licence_files": [
+      "shapely-2.1.2.dist-info__licenses__LICENSE.txt",
+      "shapely-2.1.2.dist-info__licenses__LICENSE_GEOS",
+      "shapely-2.1.2.dist-info__licenses__LICENSE_win32"
+    ]
+  },
+  {
+    "name": "shiboken6",
+    "version": "6.11.1",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "homepage": "https://pyside.org",
+    "directory": "shiboken6-6.11.1",
+    "licence_files": [
+      "shiboken6-6.11.1.dist-info__licenses__LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "typing_extensions",
+    "version": "4.16.0",
+    "scope": [
+      "runtime"
+    ],
+    "licence": "PSF-2.0",
+    "homepage": "https://typing-extensions.readthedocs.io/",
+    "directory": "typing-extensions-4.16.0",
+    "licence_files": [
+      "typing_extensions-4.16.0.dist-info__licenses__LICENSE"
+    ]
+  }
+]

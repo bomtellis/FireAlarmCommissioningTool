@@ -14,6 +14,11 @@ from openpyxl.utils import get_column_letter
 
 MATRIX_SHEET = "Cause & Effect"
 REFERENCE_SHEET = "OutputGroupInfo"
+DERIVED_REFERENCE_WARNING = (
+    f"'{REFERENCE_SHEET}' was not present; its rows were derived from "
+    f"'{MATRIX_SHEET}' by the application."
+)
+ACTIVATION_CODES = frozenset({"A", "E", "TA", "TE"})
 NODE_HEADER = re.compile(
     r"^\s*node\s+(\d+)\s*(?:[-–—]\s*)?(.*?)\s*$",
     re.IGNORECASE,
@@ -58,6 +63,7 @@ class CauseEffectWorkbook:
     matrix_only_count: int
     reference_only_count: int
     activation_codes: list[str]
+    reference_source: str = "sheet"
     reference_only: list[ReferenceActivation] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     reference_only_examples: list[str] = field(default_factory=list)
@@ -85,9 +91,17 @@ def read_cause_effect_workbook(path: str | Path) -> CauseEffectWorkbook:
     )
     try:
         matrix = workbook[_sheet_name(workbook.sheetnames, MATRIX_SHEET)]
-        reference = workbook[_sheet_name(workbook.sheetnames, REFERENCE_SHEET)]
-        activations, output_groups = _read_matrix(matrix)
-        references = _read_reference(reference)
+        activations, output_groups, matrix_warnings = _read_matrix(matrix)
+        reference_name = _optional_sheet_name(
+            workbook.sheetnames,
+            REFERENCE_SHEET,
+        )
+        if reference_name is None:
+            references = _derive_reference(activations)
+            reference_source = "derived"
+        else:
+            references = _read_reference(workbook[reference_name])
+            reference_source = "sheet"
     finally:
         workbook.close()
 
@@ -95,6 +109,12 @@ def read_cause_effect_workbook(path: str | Path) -> CauseEffectWorkbook:
         activations,
         references,
     )
+    warnings[:0] = matrix_warnings
+    if reference_source == "derived":
+        for activation in activations:
+            if activation.reference_status == "matched":
+                activation.reference_status = "derived"
+        warnings.insert(0, DERIVED_REFERENCE_WARNING)
     matrix_only_count = sum(
         activation.reference_status == "matrix_only" for activation in activations
     )
@@ -122,6 +142,7 @@ def read_cause_effect_workbook(path: str | Path) -> CauseEffectWorkbook:
         matrix_only_count=matrix_only_count,
         reference_only_count=len(reference_only),
         activation_codes=activation_codes,
+        reference_source=reference_source,
         reference_only=reference_only,
         warnings=warnings,
         reference_only_examples=[
@@ -131,16 +152,30 @@ def read_cause_effect_workbook(path: str | Path) -> CauseEffectWorkbook:
 
 
 def _sheet_name(sheet_names: Iterable[str], expected: str) -> str:
+    name = _optional_sheet_name(sheet_names, expected)
+    if name is not None:
+        return name
+    raise ValueError(f"Workbook is missing the required '{expected}' sheet.")
+
+
+def _optional_sheet_name(
+    sheet_names: Iterable[str],
+    expected: str,
+) -> str | None:
     normalised_expected = _normalise_header(expected)
     for name in sheet_names:
         if _normalise_header(name) == normalised_expected:
             return name
-    raise ValueError(f"Workbook is missing the required '{expected}' sheet.")
+    return None
 
 
 def _read_matrix(
     sheet,
-) -> tuple[list[CauseEffectActivation], list[CauseEffectOutputGroup]]:
+) -> tuple[
+    list[CauseEffectActivation],
+    list[CauseEffectOutputGroup],
+    list[str],
+]:
     rows = sheet.iter_rows(values_only=True)
     try:
         names = next(rows)
@@ -149,24 +184,31 @@ def _read_matrix(
     except StopIteration as error:
         raise ValueError(f"'{MATRIX_SHEET}' does not contain its three header rows.") from error
 
-    output_columns = _output_columns(names, node_headers, group_numbers)
+    body_rows = list(rows)
+    zone_column, zone_name_column = _matrix_zone_columns(body_rows)
+    output_columns, warnings = _output_columns(
+        names,
+        node_headers,
+        group_numbers,
+        zone_column + 1,
+    )
     if not output_columns:
         raise ValueError(
             f"'{MATRIX_SHEET}' did not contain any node/output-group columns."
-    )
+        )
 
     activations: list[CauseEffectActivation] = []
-    for source_row, row in enumerate(rows, start=4):
-        trigger_zone = normalise_zone_key(_value(row, 4))
+    for source_row, row in enumerate(body_rows, start=4):
+        trigger_zone = normalise_zone_key(_value(row, zone_column))
         if not trigger_zone:
             continue
-        trigger_zone_name = _text(_value(row, 2))
+        trigger_zone_name = _text(_value(row, zone_name_column))
         for output in output_columns:
             raw_code = _value(row, output.index)
             if raw_code in (None, ""):
                 continue
             code = _activation_code(raw_code)
-            if not code:
+            if code not in ACTIVATION_CODES:
                 continue
             activations.append(
                 CauseEffectActivation(
@@ -185,32 +227,61 @@ def _read_matrix(
 
     if not activations:
         raise ValueError(f"'{MATRIX_SHEET}' did not contain any activations.")
-    return activations, output_columns
+    return activations, output_columns, warnings
+
+
+def _matrix_zone_columns(
+    body_rows: list[tuple[object, ...]],
+) -> tuple[int, int]:
+    zone_column: int | None = None
+    zone_name_column: int | None = None
+    for row in body_rows[:8]:
+        for index, value in enumerate(row):
+            header = _normalise_header(value)
+            if header == "newzone":
+                zone_column = index
+            elif header == "zone" and zone_column is None:
+                zone_column = index
+            if header.endswith("zonelabel"):
+                zone_name_column = index
+        if zone_column is not None and zone_name_column is not None:
+            break
+    if zone_column is None:
+        raise ValueError(
+            f"'{MATRIX_SHEET}' did not contain a Zone or New Zone column."
+        )
+    if zone_name_column is None:
+        zone_name_column = max(0, zone_column - 2)
+    return zone_column, zone_name_column
 
 
 def _output_columns(
     names: tuple[object, ...],
     node_headers: tuple[object, ...],
     group_numbers: tuple[object, ...],
-) -> list[CauseEffectOutputGroup]:
+    start_column: int,
+) -> tuple[list[CauseEffectOutputGroup], list[str]]:
     result: list[CauseEffectOutputGroup] = []
+    unresolved: list[tuple[int, int, str]] = []
     target_node: int | None = None
     target_node_name = ""
     width = max(len(names), len(node_headers), len(group_numbers))
-    for index in range(5, width):
+    for index in range(start_column, width):
         header = _text(_value(node_headers, index))
         if header:
-            match = NODE_HEADER.match(header)
-            if not match:
+            node = _node_header(header)
+            if node is None:
                 target_node = None
                 target_node_name = ""
-                continue
-            target_node = int(match.group(1))
-            target_node_name = match.group(2).strip()
+            else:
+                target_node, target_node_name = node
 
         output_group = _positive_integer(_value(group_numbers, index))
         output_group_name = _text(_value(names, index))
-        if target_node is None or output_group is None or not output_group_name:
+        if output_group is None or not output_group_name:
+            continue
+        if target_node is None:
+            unresolved.append((index, output_group, output_group_name))
             continue
         result.append(
             CauseEffectOutputGroup(
@@ -221,7 +292,142 @@ def _output_columns(
                 output_group_name=output_group_name,
             )
         )
-    return result
+
+    inferred: dict[int, list[str]] = defaultdict(list)
+    unmapped: list[str] = []
+    for index, output_group, output_group_name in unresolved:
+        previous = max(
+            (output for output in result if output.index < index),
+            key=lambda output: output.index,
+            default=None,
+        )
+        following = min(
+            (output for output in result if output.index > index),
+            key=lambda output: output.index,
+            default=None,
+        )
+        inferred_node: int | None = None
+        if (
+            previous is not None
+            and previous.index == index - 1
+            and previous.target_node in inferred
+        ):
+            inferred_node = previous.target_node
+        elif (
+            previous is not None
+            and following is not None
+            and following.target_node == previous.target_node + 2
+        ):
+            inferred_node = previous.target_node + 1
+        elif previous is not None and following is None:
+            inferred_node = previous.target_node + 1
+
+        column = get_column_letter(index + 1)
+        if inferred_node is None:
+            unmapped.append(column)
+            continue
+        inferred[inferred_node].append(column)
+        result.append(
+            CauseEffectOutputGroup(
+                index=index,
+                target_node=inferred_node,
+                target_node_name=f"Station {inferred_node}",
+                output_group=output_group,
+                output_group_name=output_group_name,
+            )
+        )
+    result.sort(key=lambda output: output.index)
+
+    warnings: list[str] = []
+    for inferred_node, columns in inferred.items():
+        examples = ", ".join(columns[:12])
+        if len(columns) > 12:
+            examples += ", ..."
+        warnings.append(
+            f"Inferred node/station {inferred_node} for {len(columns)} "
+            f"output-group columns with a blank header ({examples})."
+        )
+    if unmapped:
+        examples = ", ".join(unmapped[:12])
+        if len(unmapped) > 12:
+            examples += ", ..."
+        warnings.append(
+            f"Skipped {len(unmapped)} output-group columns whose node/station "
+            f"header was blank or unrecognised ({examples})."
+        )
+    return result, warnings
+
+
+def _node_header(value: object) -> tuple[int, str] | None:
+    header = _text(value)
+    match = NODE_HEADER.match(header)
+    if match:
+        return int(match.group(1)), match.group(2).strip()
+
+    panel = re.match(
+        r"^\s*panel\s+0*(\d+)\b\s*(.*?)\s*$",
+        header,
+        re.IGNORECASE,
+    )
+    if panel:
+        return int(panel.group(1)), panel.group(2).strip()
+
+    station = re.search(r"\bstation\s+0*(\d+)\b", header, re.IGNORECASE)
+    if station:
+        target_node = int(station.group(1))
+        name = re.sub(
+            r"\(?\s*station\s+0*\d+\s*\)?",
+            "",
+            header,
+            flags=re.IGNORECASE,
+        ).strip(" -()")
+        return target_node, name or header
+
+    fa = re.match(r"^\s*FA\s*0*(\d+)\b\s*(.*?)\s*$", header, re.IGNORECASE)
+    if fa:
+        return int(fa.group(1)), fa.group(2).strip(" -()")
+    return None
+
+
+def _derive_reference(
+    activations: list[CauseEffectActivation],
+) -> list[ReferenceActivation]:
+    zone_names: dict[str, str] = {}
+    for activation in activations:
+        if activation.trigger_zone_name:
+            zone_names.setdefault(
+                activation.trigger_zone.casefold(),
+                activation.trigger_zone_name,
+            )
+
+    return [
+        ReferenceActivation(
+            target_node=activation.target_node,
+            target_node_name=activation.target_node_name,
+            output_group=activation.output_group,
+            output_group_name=activation.output_group_name,
+            trigger_zone=activation.trigger_zone,
+            output_zone_name=_derived_output_zone_name(
+                activation.output_group_name,
+                zone_names,
+            ),
+            activation_code=activation.activation_code,
+            source_row=activation.source_row,
+        )
+        for activation in activations
+    ]
+
+
+def _derived_output_zone_name(
+    output_group_name: str,
+    zone_names: dict[str, str],
+) -> str:
+    if "sounders" not in output_group_name.casefold():
+        return ""
+    words = output_group_name.split()
+    if len(words) < 2:
+        return ""
+    return zone_names.get(normalise_zone_key(words[1]).casefold(), "")
 
 
 def _read_reference(sheet) -> list[ReferenceActivation]:

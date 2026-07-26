@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
+import zipfile
 from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from firepanel.cause_effect import read_cause_effect_workbook
+from firepanel.cause_effect import (
+    DERIVED_REFERENCE_WARNING,
+    read_cause_effect_workbook,
+)
 from firepanel.project import ProjectRepository, zone_shape_key
 from firepanel.rules import generate_door_rules
 from firepanel.testing_workbook import (
@@ -469,6 +474,153 @@ def test_reads_matrix_and_checks_output_group_info(tmp_path: Path) -> None:
     )
     assert matrix_only.trigger_zone == "1.11"
     assert matrix_only.reference_status == "matrix_only"
+
+
+def test_derives_output_group_info_when_reference_sheet_is_missing(
+    tmp_path: Path,
+) -> None:
+    path = _workbook(tmp_path / "matrix-without-reference.xlsx")
+    workbook = load_workbook(path)
+    del workbook["OutputGroupInfo"]
+    workbook.save(path)
+    workbook.close()
+
+    parsed = read_cause_effect_workbook(path)
+
+    assert parsed.reference_source == "derived"
+    assert parsed.reference_count == 3
+    assert parsed.matched_count == 3
+    assert parsed.matrix_only_count == 0
+    assert parsed.reference_only_count == 0
+    assert {row.reference_status for row in parsed.activations} == {"derived"}
+    assert DERIVED_REFERENCE_WARNING in parsed.warnings
+    sounders = next(
+        activation
+        for activation in parsed.activations
+        if activation.output_group == 1
+        and activation.trigger_zone == "1"
+    )
+    assert sounders.output_zone_name == "Ward 1"
+
+
+def test_reads_legacy_matrix_layout_without_output_group_info(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-matrix.xlsx"
+    workbook = Workbook()
+    matrix = workbook.active
+    matrix.title = "Cause & Effect"
+    matrix["D1"] = "GROUND FLOOR SOUNDERS"
+    matrix["E1"] = "GROUND FLOOR DOORS"
+    matrix.merge_cells("D2:E2")
+    matrix["D2"] = "Panel 01 Tower Block"
+    matrix["D3"] = 2
+    matrix["E3"] = 7
+    matrix["A4"] = "Stn No"
+    matrix["B4"] = "40 CHARACTER ZONE LABEL"
+    matrix["C4"] = "Zone"
+    matrix["A7"] = 1
+    matrix["B7"] = "Ground floor ward"
+    matrix["C7"] = "1A"
+    matrix["D7"] = "E"
+    matrix["E7"] = "A"
+    matrix["F2"] = "Stn No"
+    matrix["F3"] = "O/P Group"
+    matrix["G1"] = "REMOTE SOUNDERS"
+    matrix["G2"] = "FA2 (Station 2)"
+    matrix["G3"] = 1
+    matrix["G7"] = "TA"
+    workbook.save(path)
+    workbook.close()
+
+    parsed = read_cause_effect_workbook(path)
+
+    assert parsed.reference_source == "derived"
+    assert [
+        (
+            output.target_node,
+            output.target_node_name,
+            output.output_group,
+        )
+        for output in parsed.output_groups
+    ] == [
+        (1, "Tower Block", 2),
+        (1, "Tower Block", 7),
+        (2, "FA2", 1),
+    ]
+    assert {
+        (
+            activation.trigger_zone,
+            activation.trigger_zone_name,
+            activation.target_node,
+            activation.output_group,
+            activation.activation_code,
+        )
+        for activation in parsed.activations
+    } == {
+        ("1A", "Ground floor ward", 1, 2, "E"),
+        ("1A", "Ground floor ward", 1, 7, "A"),
+        ("1A", "Ground floor ward", 2, 1, "TA"),
+    }
+    assert parsed.matched_count == 3
+    assert parsed.matrix_only_count == 0
+
+
+def test_project_can_start_with_workbook_then_import_configuration(
+    tmp_path: Path,
+) -> None:
+    workbook_path = _workbook(tmp_path / "initial-cause-effect.xlsx")
+    workbook = load_workbook(workbook_path)
+    del workbook["OutputGroupInfo"]
+    workbook.save(workbook_path)
+    workbook.close()
+
+    repository = ProjectRepository.create_from_source(
+        tmp_path / "workbook-first.fcp",
+        "Workbook first",
+        workbook_path,
+    )
+    assert repository.latest_snapshot_id() is None
+    assert repository.latest_cause_effect_import() is not None
+    assert len(repository.fetch_cause_effect_activations()) == 3
+
+    configuration_path = tmp_path / "site-after-workbook.ncf"
+    site = bytearray(336)
+    panel_name = b"Panel A"
+    site[112 + 8] = 0x12
+    site[112 + 9] = len(panel_name)
+    site[112 + 10 : 112 + 10 + len(panel_name)] = panel_name
+    site[112 + 44] = 5
+    struct.pack_into("<i", site, 224 + 8, 3)
+    struct.pack_into("<i", site, 224 + 12, 7)
+    zone_name = b"Legacy zone"
+    site[224 + 16] = len(zone_name)
+    site[224 + 17 : 224 + 17 + len(zone_name)] = zone_name
+
+    point = bytearray(224)
+    struct.pack_into("<i", point, 8, 2)
+    struct.pack_into("<i", point, 12, 45)
+    point[16] = 1
+    point[17] = 4
+    point[18] = 2
+    point[20] = len(b"Legacy detector")
+    point[21 : 21 + len(b"Legacy detector")] = b"Legacy detector"
+    struct.pack_into("<i", point, 48, 7)
+    with zipfile.ZipFile(
+        configuration_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr("SITE", site)
+        archive.writestr("Panel A.pcf", point)
+
+    snapshot_id, changes = repository.import_configuration(configuration_path)
+
+    assert snapshot_id == 1
+    assert changes
+    assert len(repository.fetch_panels()) == 1
+    assert len(repository.fetch_devices()) == 1
+    assert len(repository.fetch_cause_effect_activations()) == 3
 
 
 def test_project_import_persists_activations_and_comments(tmp_path: Path) -> None:

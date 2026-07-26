@@ -357,6 +357,17 @@ class ProjectRepository:
 
     @classmethod
     def create(cls, path: str | Path, name: str, ncf_path: str | Path) -> "ProjectRepository":
+        """Create a project from a legacy NCF or newer SKF configuration."""
+        return cls.create_from_source(path, name, ncf_path)
+
+    @classmethod
+    def create_from_source(
+        cls,
+        path: str | Path,
+        name: str,
+        source_path: str | Path,
+    ) -> "ProjectRepository":
+        """Create a project from a configuration or Cause & Effect workbook."""
         project_path = Path(path).resolve()
         project_path.parent.mkdir(parents=True, exist_ok=True)
         if project_path.exists():
@@ -365,7 +376,16 @@ class ProjectRepository:
         repository = cls(project_path)
         repository.set_metadata("project_name", name)
         repository.set_metadata("created_at", _now())
-        repository.import_configuration(ncf_path)
+        initial_source = Path(source_path)
+        if initial_source.suffix.casefold() == ".xlsx":
+            repository.import_cause_effect(initial_source)
+        elif initial_source.suffix.casefold() in {".ncf", ".skf"}:
+            repository.import_configuration(initial_source)
+        else:
+            raise ValueError(
+                "Initial project source must be a Cause & Effect workbook "
+                "(.xlsx) or network configuration (.ncf/.skf)."
+            )
         return repository
 
     def _initialise(self) -> None:

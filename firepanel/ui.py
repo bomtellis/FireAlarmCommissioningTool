@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -64,7 +65,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .cause_effect import normalise_zone_key
+from .cause_effect import DERIVED_REFERENCE_WARNING, normalise_zone_key
 from .device_catalog import catalogue_display_name, device_current_ma
 from .dxf import (
     DxfShape,
@@ -84,6 +85,18 @@ from .rules import evaluate_zone, generate_door_rules, generate_htm_rules
 from .styles import APP_STYLESHEET
 from .testing_workbook import export_testing_workbook, read_testing_workbook
 CONFIGURATION_FILTER = "Network configurations (*.ncf *.NCF *.skf *.SKF)"
+INITIAL_PROJECT_FILTER = (
+    "Cause & Effect or configuration (*.xlsx *.XLSX *.ncf *.NCF *.skf *.SKF);;"
+    "Cause & Effect workbooks (*.xlsx *.XLSX);;"
+    + CONFIGURATION_FILTER
+)
+
+
+def _application_resource_path(filename: str) -> Path:
+    packaged_root = getattr(sys, "_MEIPASS", None)
+    if packaged_root:
+        return Path(packaged_root) / filename
+    return Path(__file__).resolve().parents[1] / filename
 
 
 @lru_cache(maxsize=1)
@@ -1770,6 +1783,61 @@ class DashboardPage(Page):
             self.warnings.setPlainText("\n".join(f"• {warning}" for warning in warnings))
 
 
+class LicenceNoticesDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Rights and licence notices")
+        self.resize(940, 700)
+        layout = QVBoxLayout(self)
+
+        self.selector = QComboBox()
+        self.selector.setEditable(True)
+        self.selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.selector.addItem("Application and third-party overview", None)
+        licence_root = _application_resource_path("LICENSES")
+        if licence_root.is_dir():
+            for path in sorted(
+                (item for item in licence_root.rglob("*") if item.is_file()),
+                key=lambda item: str(item).casefold(),
+            ):
+                self.selector.addItem(
+                    str(path.relative_to(licence_root)).replace("\\", "/"),
+                    str(path),
+                )
+        completer = self.selector.completer()
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        layout.addWidget(self.selector)
+
+        self.content = QTextEdit()
+        self.content.setReadOnly(True)
+        layout.addWidget(self.content, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.selector.currentIndexChanged.connect(self._load_notice)
+        self._load_notice(0)
+
+    def _load_notice(self, index: int) -> None:
+        selected_path = self.selector.itemData(index)
+        if selected_path:
+            path = Path(selected_path)
+            self.content.setPlainText(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+            return
+        sections = []
+        for filename in ("RIGHTS_NOTICE.md", "THIRD_PARTY_NOTICES.md"):
+            path = _application_resource_path(filename)
+            if path.is_file():
+                sections.append(path.read_text(encoding="utf-8"))
+        self.content.setMarkdown(
+            "\n\n---\n\n".join(sections)
+            or "The licence notice files could not be located."
+        )
+
+
 class AboutPage(Page):
     def __init__(self):
         super().__init__("About")
@@ -1799,8 +1867,15 @@ class AboutPage(Page):
         licence.setWordWrap(True)
         card_layout.addWidget(licence)
 
+        self.licence_button = QPushButton("Rights and third-party licences")
+        self.licence_button.clicked.connect(self.show_licence_notices)
+        card_layout.addWidget(self.licence_button)
+
         self.layout.addWidget(card)
         self.layout.addStretch()
+
+    def show_licence_notices(self) -> None:
+        LicenceNoticesDialog(self).exec()
 
 
 class DevicesPage(Page):
@@ -5256,12 +5331,21 @@ class MatrixPage(Page):
             return
 
         issue_count = imported["matrix_only_count"] + imported["reference_only_count"]
-        self.validation.setText(
-            f"{imported['source_name']}: {imported['activation_count']:,} matrix "
-            f"activations; {imported['matched_count']:,} matched OutputGroupInfo; "
-            f"{imported['matrix_only_count']:,} matrix-only; "
-            f"{imported['reference_only_count']:,} reference-only."
-        )
+        import_warnings = json.loads(imported["warnings_json"])
+        reference_derived = DERIVED_REFERENCE_WARNING in import_warnings
+        if reference_derived:
+            validation_text = (
+                f"{imported['source_name']}: {imported['activation_count']:,} "
+                "matrix activations; OutputGroupInfo derived by the application."
+            )
+        else:
+            validation_text = (
+                f"{imported['source_name']}: {imported['activation_count']:,} "
+                f"matrix activations; {imported['matched_count']:,} matched "
+                f"OutputGroupInfo; {imported['matrix_only_count']:,} matrix-only; "
+                f"{imported['reference_only_count']:,} reference-only."
+            )
+        self.validation.setText(validation_text)
         self.validation.setStyleSheet(
             "color: #b45309;" if issue_count else "color: #166534;"
         )
@@ -5277,11 +5361,10 @@ class MatrixPage(Page):
                 activation["trigger_zone"],
                 activation["output_zone_name"],
                 activation["ringing_style"],
-                (
-                    "Matched"
-                    if activation["reference_status"] == "matched"
-                    else "Matrix only"
-                ),
+                {
+                    "matched": "Matched",
+                    "derived": "Derived by application",
+                }.get(activation["reference_status"], "Matrix only"),
                 activation["comments"],
             ]
             for column, value in enumerate(values):
@@ -5290,7 +5373,7 @@ class MatrixPage(Page):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 else:
                     item.setData(Qt.ItemDataRole.UserRole, activation["id"])
-                if column == 7 and activation["reference_status"] != "matched":
+                if column == 7 and activation["reference_status"] == "matrix_only":
                     item.setBackground(QColor("#fff3cd"))
                 self.activation_table.setItem(row, column, item)
         self.activation_matrix.set_activations(
@@ -5363,10 +5446,15 @@ class MatrixPage(Page):
             self.tabs.setCurrentIndex(0)
             summary = (
                 f"Imported {len(parsed.activations):,} matrix activations.\n"
-                f"{parsed.matched_count:,} matched OutputGroupInfo; "
-                f"{parsed.matrix_only_count:,} matrix-only; "
-                f"{parsed.reference_only_count:,} reference-only."
             )
+            if parsed.reference_source == "derived":
+                summary += "OutputGroupInfo was derived by the application."
+            else:
+                summary += (
+                    f"{parsed.matched_count:,} matched OutputGroupInfo; "
+                    f"{parsed.matrix_only_count:,} matrix-only; "
+                    f"{parsed.reference_only_count:,} reference-only."
+                )
             if parsed.warnings:
                 summary += "\n\n" + "\n".join(parsed.warnings)
             QMessageBox.information(self, "Cause & Effect imported", summary)
@@ -6865,7 +6953,7 @@ class MainWindow(QMainWindow):
             project_layout.addWidget(self._ribbon_button(text, icon, callback))
         project_layout.addSpacing(18)
         for text, icon, callback in (
-            ("Update configuration", "fa6s.arrows-rotate", self.update_ncf),
+            ("Import configuration", "fa6s.arrows-rotate", self.update_ncf),
             ("Import DXF", "fa6s.file-import", lambda: self._navigate(5)),
             ("Export Excel", "fa6s.file-excel", self.export_excel),
             ("Changes PDF", "fa6s.file-pdf", self.export_pdf),
@@ -6923,6 +7011,10 @@ class MainWindow(QMainWindow):
             action.triggered.connect(callback)
             file_menu.addAction(action)
         file_menu.addSeparator()
+        configuration_action = QAction("Import configuration…", self)
+        configuration_action.triggered.connect(self.update_ncf)
+        file_menu.addAction(configuration_action)
+        file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -6968,12 +7060,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No project open")
 
     def new_project(self) -> None:
-        ncf_path, _ = QFileDialog.getOpenFileName(
-            self, "Select initial configuration", "", CONFIGURATION_FILTER
+        initial_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select initial Cause & Effect workbook or configuration",
+            "",
+            INITIAL_PROJECT_FILTER,
         )
-        if not ncf_path:
+        if not initial_path:
             return
-        name, ok = QInputDialog.getText(self, "Project name", "Name", text=Path(ncf_path).stem)
+        name, ok = QInputDialog.getText(
+            self,
+            "Project name",
+            "Name",
+            text=Path(initial_path).stem,
+        )
         if not ok or not name:
             return
         project_path, _ = QFileDialog.getSaveFileName(
@@ -6983,8 +7083,14 @@ class MainWindow(QMainWindow):
             return
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            repository = ProjectRepository.create(project_path, name, ncf_path)
+            repository = ProjectRepository.create_from_source(
+                project_path,
+                name,
+                initial_path,
+            )
             self._set_repository(repository)
+            if Path(initial_path).suffix.casefold() == ".xlsx":
+                self._navigate(6)
         except Exception as error:
             QMessageBox.critical(self, "Project creation failed", str(error))
         finally:
@@ -7021,22 +7127,27 @@ class MainWindow(QMainWindow):
         if not self.repository:
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import updated configuration", "", CONFIGURATION_FILTER
+            self, "Import configuration", "", CONFIGURATION_FILTER
         )
         if not path:
             return
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            had_configuration = self.repository.latest_snapshot_id() is not None
             _, changes = self.repository.import_configuration(path)
             self._set_repository(self.repository)
-            self._navigate(8)
+            self._navigate(8 if had_configuration else 0)
+            if had_configuration:
+                message = f"Recorded {len(changes)} changes."
+            else:
+                message = "Imported the initial site configuration."
             QMessageBox.information(
                 self,
-                "Configuration update complete",
-                f"Recorded {len(changes)} changes.",
+                "Configuration import complete",
+                message,
             )
         except Exception as error:
-            QMessageBox.critical(self, "Configuration update failed", str(error))
+            QMessageBox.critical(self, "Configuration import failed", str(error))
         finally:
             QApplication.restoreOverrideCursor()
 

@@ -30,6 +30,7 @@ from firepanel.ui import (
     DoorDialog,
     DxfManagementDialog,
     FilterableTableWidget,
+    LicenceNoticesDialog,
     MainWindow,
     MapGraphicsView,
     MatrixPage,
@@ -43,6 +44,7 @@ from firepanel.ui import (
     ZoneTestExportDialog,
     _add_door_graphics,
     _add_fire_alarm_symbol,
+    _application_resource_path,
     _device_symbol,
     _dxf_text_font,
     _item,
@@ -101,6 +103,11 @@ def test_export_menu_is_next_to_file_and_grouped() -> None:
     top_level = window.menuBar().actions()
     assert [action.text() for action in top_level[:2]] == ["&File", "&Export"]
     assert top_level[0].menu().minimumWidth() == 300
+    assert "Import configuration…" in [
+        action.text()
+        for action in top_level[0].menu().actions()
+        if not action.isSeparator()
+    ]
 
     export_actions = top_level[1].menu().actions()
     assert [
@@ -133,7 +140,7 @@ def test_every_ribbon_action_has_an_appropriate_icon() -> None:
         "Save": "fa6s.floppy-disk",
         "Save as": "fa6s.file-export",
         "Close": "fa6s.xmark",
-        "Update configuration": "fa6s.arrows-rotate",
+        "Import configuration": "fa6s.arrows-rotate",
         "Import DXF": "fa6s.file-import",
         "Export Excel": "fa6s.file-excel",
         "Changes PDF": "fa6s.file-pdf",
@@ -164,8 +171,29 @@ def test_main_window_has_about_tab_with_application_version() -> None:
     about_page = window.pages[-1]
     assert isinstance(about_page, AboutPage)
     assert about_page.version_label.text() == f"Version {__version__}"
+    assert about_page.licence_button.text() == "Rights and third-party licences"
+    assert _application_resource_path("RIGHTS_NOTICE.md").is_file()
+    assert _application_resource_path("THIRD_PARTY_NOTICES.md").is_file()
     assert window.stack.widget(window.stack.count() - 1) is about_page
     window.close()
+
+
+def test_licence_dialog_browses_complete_notice_archive() -> None:
+    _application()
+    dialog = LicenceNoticesDialog()
+
+    assert dialog.selector.count() > 80
+    assert (
+        dialog.selector.completer().filterMode()
+        == Qt.MatchFlag.MatchContains
+    )
+    qt_notice = dialog.selector.findText(
+        "third-party/qt-6.11.1/NOTICE.md"
+    )
+    assert qt_notice >= 0
+    dialog.selector.setCurrentIndex(qt_notice)
+    assert "Qt and Qt for Python notice" in dialog.content.toPlainText()
+    dialog.close()
 
 
 def test_testing_export_dialog_uses_transfer_lists_and_typeahead() -> None:
